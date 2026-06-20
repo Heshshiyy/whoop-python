@@ -208,6 +208,14 @@ class WhoopBleClient:
                 timeout=timeout,
             )
             await self._ble_client.connect()
+            
+            # Pair/bond — WHOOP 4.0 requires bonding before accepting commands
+            try:
+                await self._ble_client.pair(protection_level=1)
+                logger.info("Paired with %s", address)
+            except Exception as exc:
+                logger.warning("Pairing may have failed (non-fatal): %s", exc)
+            
             self._set_state(ConnectionState.CONNECTED)
             self._backoff.reset()
             logger.info("Connected to %s (family=%s)", address, family.value)
