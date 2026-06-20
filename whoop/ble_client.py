@@ -284,11 +284,14 @@ class WhoopBleClient:
             # Subscribe to notifications first
             await self._ble_client.start_notify(notify_uuid, self._on_notification)
 
-            # Write command
-            await self._ble_client.write_gatt_char(char_uuid, frame, response=False)
+            # Small delay for CCCD to activate on the peripheral
+            await asyncio.sleep(0.3)
 
-            # Wait for response
-            result = await asyncio.wait_for(response_future, timeout=5.0)
+            # Write command WITH response — this triggers just-works bonding on WHOOP 4.0
+            await self._ble_client.write_gatt_char(char_uuid, frame, response=True)
+
+            # Wait for response (longer timeout for first command — bonding takes time)
+            result = await asyncio.wait_for(response_future, timeout=10.0)
             return result
         except asyncio.TimeoutError:
             logger.warning("Command response timeout")
