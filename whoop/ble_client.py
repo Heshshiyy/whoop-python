@@ -364,28 +364,26 @@ class WhoopBleClient:
         notify_uuid = self._family.cmd_notify_uuid
 
         # Queue to capture the response — raw bytes from CMD notify
-        # Track chunks before command write to filter stale notifications
+        response_future: asyncio.Future[bytes] = asyncio.get_event_loop().create_future()
         raw_chunks: list[bytes] = []
-        stale_count = 0
         
         def _capture_response(_sender: int, data: bytearray) -> None:
             raw = bytes(data)
             logger.debug("CMD notify raw: %d bytes: %s", len(raw), raw.hex()[:80])
             raw_chunks.append(raw)
-            # Only set result for notifications arriving after command write
-            # (stale_count tracks how many arrived before the command)
-            if not response_future.done() and len(raw_chunks) > stale_count:
-                # Feed fresh data to reassembler
-                accumulated = b"".join(raw_chunks[stale_count:])
+            if not response_future.done():
+                # Feed to reassembler first, then wait briefly for it to produce inner frame
+                accumulated = b"".join(raw_chunks)
                 if self._reassembler:
                     self._reassembler.feed(accumulated)
-                # Wait briefly for reassembler to produce inner frame, then set raw result
-                def _set_result():
-                    if not response_future.done():
-                        response_future.set_result(accumulated)
-                asyncio.get_event_loop().call_later(0.2, _set_result)
-            elif self._reassembler:
-                self._reassembler.feed(bytes(data))
+                # Give reassembler a moment to produce frame (handled in _on_frame_capture)
+                # If no frame within 200ms, return raw bytes
+                asyncio.get_event_loop().call_later(0.2, 
+                    lambda: response_future.done() or response_future.set_result(accumulated)
+                )
+            else:
+                if self._reassembler:
+                    self._reassembler.feed(bytes(data))
         
         def _on_frame_capture(inner: bytes) -> None:
             logger.debug("Reassembler produced frame: %d bytes", len(inner))
@@ -406,12 +404,7 @@ class WhoopBleClient:
             await self._ble_client.start_notify(notify_uuid, _capture_response)
             await asyncio.sleep(0.5)
             logger.debug("Re-subscribed CMD notify for command capture")
-            
-            # Re-subscribed, now flush stale notifications
-            await asyncio.sleep(0.4)
-            stale_count = len(raw_chunks)  # Mark existing chunks as stale
-            logger.debug("Flushed %d stale chunks", stale_count)
-            
+
             # Write command
             try:
                 await self._ble_client.write_gatt_char(char_uuid, frame, response=True)
