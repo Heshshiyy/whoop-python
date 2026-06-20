@@ -228,9 +228,12 @@ class WhoopBleClient:
     async def _trigger_bond(self) -> None:
         """Trigger just-works bonding by writing GET_BATTERY_LEVEL to the CMD characteristic.
         
-        WHOOP 4.0 requires bonding before it will respond to commands. The first
-        write with response=True to the CMD characteristic triggers just-works
-        pairing (no PIN required). After the bond completes, commands work normally.
+        WHOOP 4.0 requires bonding before it will respond to commands. The bond flow:
+        1. Write to CMD char → strap rejects with "Insufficient Authentication"
+        2. Windows BLE stack triggers just-works pairing (no PIN)
+        3. Connection drops during pairing
+        4. Reconnect (now bonded)
+        5. Re-subscribe to notifications
         """
         from whoop.protocol.commands import Command
         if self._ble_client is None or self._family is None:
@@ -238,37 +241,89 @@ class WhoopBleClient:
         
         notify_uuid = self._family.cmd_notify_uuid
         char_uuid = self._family.cmd_char_uuid
+        address = self._device.address if self._device else ""
         
-        # Subscribe to command notifications first
+        # Step 1: Subscribe to notifications and trigger bond
         try:
             await self._ble_client.start_notify(notify_uuid, self._on_notification)
-            await asyncio.sleep(0.3)
-        except Exception:
-            pass
+            await asyncio.sleep(0.5)
+            logger.debug("Subscribed to CMD notify")
+        except Exception as e:
+            logger.warning("Could not subscribe to notify: %s", e)
+            return
         
         frame = Command.GET_BATTERY_LEVEL.build_frame(seq=0, payload=b"", family=self._family)
         
         for attempt in range(3):
             try:
+                logger.debug("Bond attempt %d: writing to CMD char...", attempt + 1)
                 await self._ble_client.write_gatt_char(char_uuid, frame, response=True)
                 self._bonded = True
-                logger.info("Bond established")
+                logger.info("Bond established — command accepted")
                 return
             except Exception as e:
                 msg = str(e)
-                if "Insufficient Authentication" in msg:
-                    logger.info("Bonding triggered, waiting for pairing...")
-                    await asyncio.sleep(3.0)  # Wait for OS to complete pairing
-                    continue
-                elif "Protocol Error" in msg or "Unlikely" in msg:
-                    logger.info("Bond attempt %d failed (retrying): %s", attempt + 1, e)
+                logger.debug("Bond attempt %d error: %s", attempt + 1, msg)
+                
+                if "Insufficient Authentication" in msg or "Insufficient Encryption" in msg:
+                    logger.info("Bonding triggered — waiting for Windows pairing to complete...")
+                    await asyncio.sleep(5.0)
+                    
+                    # Connection may have dropped — try to reconnect
+                    try:
+                        await self._ble_client.disconnect()
+                    except Exception:
+                        pass
+                    
+                    logger.debug("Reconnecting after pairing...")
+                    try:
+                        self._ble_client = BleakClient(
+                            self._device or address,
+                            disconnected_callback=self._on_ble_disconnect,
+                            timeout=15.0,
+                        )
+                        await self._ble_client.connect()
+                        logger.debug("Reconnected — re-subscribing notify")
+                        await self._ble_client.start_notify(notify_uuid, self._on_notification)
+                        await asyncio.sleep(0.5)
+                        
+                        # Try the write again on the new connection
+                        try:
+                            await self._ble_client.write_gatt_char(char_uuid, frame, response=True)
+                            self._bonded = True
+                            logger.info("Bond established after reconnect")
+                            return
+                        except Exception as e2:
+                            logger.debug("Write after reconnect failed: %s", e2)
+                    except Exception as e3:
+                        logger.debug("Reconnect failed: %s", e3)
+                    
+                    continue  # Retry
+                    
+                elif "Protocol Error" in msg:
+                    logger.debug("Protocol error — retrying in 2s")
                     await asyncio.sleep(2.0)
                     continue
+                elif "disconnected" in msg.lower() or "not connected" in msg.lower():
+                    logger.info("Connection lost during bonding — reconnecting...")
+                    await asyncio.sleep(3.0)
+                    try:
+                        self._ble_client = BleakClient(
+                            self._device or address,
+                            disconnected_callback=self._on_ble_disconnect,
+                            timeout=15.0,
+                        )
+                        await self._ble_client.connect()
+                        await self._ble_client.start_notify(notify_uuid, self._on_notification)
+                        await asyncio.sleep(0.5)
+                        continue
+                    except Exception:
+                        break
                 else:
-                    logger.warning("Bonding failed: %s", e)
+                    logger.warning("Unexpected bonding error: %s", e)
                     break
         
-        logger.warning("Bonding did not complete — commands may not work")
+        logger.warning("Bonding did not complete after 3 attempts")
 
     async def disconnect(self) -> None:
         """Disconnect from the strap gracefully."""

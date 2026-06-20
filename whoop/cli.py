@@ -355,6 +355,13 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
 
+    # Enable debug logging
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
     cmd_map = {
         "scan": _cmd_scan,
         "info": _cmd_info,
