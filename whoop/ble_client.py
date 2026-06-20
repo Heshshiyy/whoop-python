@@ -372,18 +372,19 @@ class WhoopBleClient:
             logger.debug("CMD notify raw: %d bytes: %s", len(raw), raw.hex()[:80])
             raw_chunks.append(raw)
             if not response_future.done():
-                # Set first result immediately — cmd responses are single-frame
+                # Feed to reassembler first, then wait briefly for it to produce inner frame
                 accumulated = b"".join(raw_chunks)
-                response_future.set_result(accumulated)
-                # Also feed to reassembler for frame extraction
-                idx = accumulated.find(b"\xaa")
-                if idx >= 0 and self._reassembler:
-                    self._reassembler.feed(accumulated[idx:])
+                if self._reassembler:
+                    self._reassembler.feed(accumulated)
+                # Give reassembler a moment to produce frame (handled in _on_frame_capture)
+                # If no frame within 200ms, return raw bytes
+                asyncio.get_event_loop().call_later(0.2, 
+                    lambda: response_future.done() or response_future.set_result(accumulated)
+                )
             else:
                 if self._reassembler:
                     self._reassembler.feed(bytes(data))
         
-        # Capture via reassembler too
         def _on_frame_capture(inner: bytes) -> None:
             logger.debug("Reassembler produced frame: %d bytes", len(inner))
             if not response_future.done():
@@ -441,27 +442,30 @@ class WhoopBleClient:
     # ------------------------------------------------------------------
 
     async def start_realtime_hr(self) -> bool:
-        """Subscribe to HR notifications and start the realtime stream.
+        """Complete WHOOP handshake and start realtime HR streaming.
         
-        Returns True on success.
+        Performs the full handshake sequence required for WHOOP 4.0 to begin
+        sending type-40 REALTIME_DATA frames on the data notify channel.
         """
         if self._ble_client is None or not self._ble_client.is_connected:
             return False
         if self._family is None:
             return False
-
+        
+        from whoop.protocol.commands import Command
+        
+        # Step 1: Subscribe to standard BLE Heart Rate (0x2A37)
         try:
-            # Subscribe to standard BLE Heart Rate characteristic (0x2A37)
             await self._ble_client.start_notify(
                 "00002a37-0000-1000-8000-00805f9b34fb",
-                self._on_notification,
+                self._on_std_hr,
             )
             logger.info("Standard HR notifications enabled (0x2A37)")
         except Exception as exc:
-            logger.debug("Standard HR notify failed: %s", exc)
+            logger.debug("Standard HR notify failed (non-fatal): %s", exc)
         
+        # Step 2: Subscribe to WHOOP event and data channels
         try:
-            # Subscribe to WHOOP event and data channels
             await self._ble_client.start_notify(
                 self._family.event_notify_uuid,
                 self._on_notification,
@@ -475,18 +479,64 @@ class WhoopBleClient:
             logger.error("Failed to start WHOOP notifications: %s", exc)
             return False
         
-        # Send TOGGLE_REALTIME_HR (cmd 3) with 0x01 to start HR streaming
-        try:
-            from whoop.protocol.commands import Command
-            start_hr = Command.TOGGLE_REALTIME_HR.build_frame(
-                seq=0, payload=b"\x01", family=self._family
-            )
-            await self.send_command(start_hr)
+        # Step 3: Run WHOOP 4.0 handshake sequence
+        import time as _time
+        now = int(_time.time())
+        
+        # SET_CLOCK (cmd 10) — sync phone time to strap (required before data flows)
+        clock_payload = now.to_bytes(4, "little") + b"\x00\x00\x00\x00"
+        resp = await self.send_command(
+            Command.SET_CLOCK.build_frame(seq=1, payload=clock_payload, family=self._family)
+        )
+        if resp:
+            logger.info("Clock synced")
+        else:
+            logger.debug("SET_CLOCK no response (non-fatal)")
+        
+        # STOP raw type-43 flood (cmd 63 with 0x00)
+        resp = await self.send_command(
+            Command.SEND_R10_R11_REALTIME.build_frame(seq=2, payload=b"\x00", family=self._family)
+        )
+        if resp:
+            logger.info("Raw data flood stopped")
+        
+        # Start realtime HR streaming (cmd 3 with 0x01)
+        resp = await self.send_command(
+            Command.TOGGLE_REALTIME_HR.build_frame(seq=3, payload=b"\x01", family=self._family)
+        )
+        if resp:
             logger.info("Realtime HR streaming started")
-        except Exception as exc:
-            logger.debug("TOGGLE_REALTIME_HR failed (non-fatal): %s", exc)
         
         return True
+
+    def _on_std_hr(self, _sender: int, data: bytearray) -> None:
+        """Handle standard BLE HR Measurement (0x2A37) — non-enveloped format."""
+        raw = bytes(data)
+        if len(raw) < 2:
+            return
+        try:
+            flags = raw[0]
+            hr_fmt_16 = (flags & 0x01) != 0
+            hr = (raw[2] << 8) | raw[1] if hr_fmt_16 and len(raw) >= 3 else raw[1]
+            
+            rr_intervals = []
+            idx = 2 if not hr_fmt_16 else 3
+            if (flags & 0x10) != 0:  # Energy present
+                idx += 2
+            if (flags & 0x20) != 0:  # RR present
+                while idx + 1 < len(raw):
+                    rr = (raw[idx + 1] << 8) | raw[idx]
+                    rr_ms = round(rr * 1000 / 1024)
+                    rr_intervals.append(rr_ms)
+                    idx += 2
+            
+            logger.debug("Std HR: %d bpm, %d RR intervals", hr, len(rr_intervals))
+            
+            if self.on_data:
+                # Emit as simple dict for the record callback
+                self.on_data({"heart_rate": hr, "rr_intervals": rr_intervals})
+        except Exception as e:
+            logger.debug("Std HR parse error: %s", e)
 
     async def start_data_stream(self) -> bool:
         """Subscribe to the WHOOP data notification channel.

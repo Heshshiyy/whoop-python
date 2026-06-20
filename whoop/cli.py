@@ -181,20 +181,25 @@ async def _cmd_record(args: argparse.Namespace) -> int:
     rr_buffer: list[tuple[int, float]] = []
 
     def on_data(parsed: object) -> None:
-        from whoop.protocol.parsed_frame import RealtimeData, Event
-        if isinstance(parsed, RealtimeData):
-            ts = parsed.timestamp
-            if ts == 0:
+        from whoop.protocol.parsed_frame import RealtimeData
+        if isinstance(parsed, dict):
+            # Standard BLE HR data
+            hr = parsed.get("heart_rate", 0)
+            if hr > 0:
                 ts = int(time.time())
+                hr_buffer.append((ts, hr))
+                print(f"  HR: {hr} bpm (std)")
+            for rr in parsed.get("rr_intervals", []):
+                ts = int(time.time())
+                rr_buffer.append((ts, float(rr)))
+        elif isinstance(parsed, RealtimeData):
+            ts = parsed.timestamp or int(time.time())
             hr = parsed.heart_rate
             if hr > 0:
                 hr_buffer.append((ts, hr))
-                print(f"  HR: {hr} bpm  |  RR count: {parsed.rr_count}")
+                print(f"  HR: {hr} bpm  |  RR: {parsed.rr_count} intervals")
             for rr in parsed.rr_intervals:
                 rr_buffer.append((ts, float(rr)))
-        elif isinstance(parsed, Event):
-            ts = parsed.event_timestamp or int(time.time())
-            db.insert_events(device_id, [(ts, parsed.event_kind.value)])
 
     client.on_data = on_data
 
