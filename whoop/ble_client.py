@@ -106,6 +106,7 @@ class WhoopBleClient:
         self._seq: int = 0
         self._backoff: _Backoff = _Backoff()
         self._auto_reconnect: bool = False
+        self._bonded: bool = False
         self._reconnect_task: asyncio.Task[None] | None = None
         self._scan_filter_uuids: list[str] = []
 
@@ -209,21 +210,65 @@ class WhoopBleClient:
             )
             await self._ble_client.connect()
             
-            # Pair/bond — WHOOP 4.0 requires bonding before accepting commands
-            try:
-                await self._ble_client.pair(protection_level=1)
-                logger.info("Paired with %s", address)
-            except Exception as exc:
-                logger.warning("Pairing may have failed (non-fatal): %s", exc)
+            self._bonded = False
             
             self._set_state(ConnectionState.CONNECTED)
             self._backoff.reset()
             logger.info("Connected to %s (family=%s)", address, family.value)
+            
+            # Trigger bonding — WHOOP 4.0 requires just-works pairing before accepting commands
+            await self._trigger_bond()
+            
             return True
         except Exception as exc:
             logger.error("Connection failed: %s", exc)
             self._set_state(ConnectionState.DISCONNECTED)
             return False
+
+    async def _trigger_bond(self) -> None:
+        """Trigger just-works bonding by writing GET_BATTERY_LEVEL to the CMD characteristic.
+        
+        WHOOP 4.0 requires bonding before it will respond to commands. The first
+        write with response=True to the CMD characteristic triggers just-works
+        pairing (no PIN required). After the bond completes, commands work normally.
+        """
+        from whoop.protocol.commands import Command
+        if self._ble_client is None or self._family is None:
+            return
+        
+        notify_uuid = self._family.cmd_notify_uuid
+        char_uuid = self._family.cmd_char_uuid
+        
+        # Subscribe to command notifications first
+        try:
+            await self._ble_client.start_notify(notify_uuid, self._on_notification)
+            await asyncio.sleep(0.3)
+        except Exception:
+            pass
+        
+        frame = Command.GET_BATTERY_LEVEL.build_frame(seq=0, payload=b"", family=self._family)
+        
+        for attempt in range(3):
+            try:
+                await self._ble_client.write_gatt_char(char_uuid, frame, response=True)
+                self._bonded = True
+                logger.info("Bond established")
+                return
+            except Exception as e:
+                msg = str(e)
+                if "Insufficient Authentication" in msg:
+                    logger.info("Bonding triggered, waiting for pairing...")
+                    await asyncio.sleep(3.0)  # Wait for OS to complete pairing
+                    continue
+                elif "Protocol Error" in msg or "Unlikely" in msg:
+                    logger.info("Bond attempt %d failed (retrying): %s", attempt + 1, e)
+                    await asyncio.sleep(2.0)
+                    continue
+                else:
+                    logger.warning("Bonding failed: %s", e)
+                    break
+        
+        logger.warning("Bonding did not complete — commands may not work")
 
     async def disconnect(self) -> None:
         """Disconnect from the strap gracefully."""
@@ -289,16 +334,24 @@ class WhoopBleClient:
             self._reassembler.on_frame = _capture_response
 
         try:
-            # Subscribe to notifications first
-            await self._ble_client.start_notify(notify_uuid, self._on_notification)
+            # Notifications should already be subscribed from _trigger_bond.
+            # If they weren't, subscribe now.
+            if not self._bonded:
+                try:
+                    await self._ble_client.start_notify(notify_uuid, self._on_notification)
+                    await asyncio.sleep(0.3)
+                except Exception:
+                    pass
 
-            # Small delay for CCCD to activate on the peripheral
-            await asyncio.sleep(0.3)
+            # Write command (response=True was already used for bonding; this write
+            # should succeed normally now)
+            try:
+                await self._ble_client.write_gatt_char(char_uuid, frame, response=True)
+            except Exception:
+                # Fallback: try without response if bonded
+                await self._ble_client.write_gatt_char(char_uuid, frame, response=False)
 
-            # Write command WITH response — this triggers just-works bonding on WHOOP 4.0
-            await self._ble_client.write_gatt_char(char_uuid, frame, response=True)
-
-            # Wait for response (longer timeout for first command — bonding takes time)
+            # Wait for response
             result = await asyncio.wait_for(response_future, timeout=10.0)
             return result
         except asyncio.TimeoutError:
