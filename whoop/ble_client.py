@@ -370,23 +370,16 @@ class WhoopBleClient:
         def _capture_response(_sender: int, data: bytearray) -> None:
             raw = bytes(data)
             logger.debug("CMD notify raw: %d bytes: %s", len(raw), raw.hex()[:80])
+            raw_chunks.append(raw)
             if not response_future.done():
-                raw_chunks.append(raw)
-                # Try to extract a frame from accumulated data
+                # Set first result immediately — cmd responses are single-frame
                 accumulated = b"".join(raw_chunks)
-                # Look for SOF-delimited frame
-                idx = accumulated.find(b"\xaa")
-                if idx >= 0:
-                    try:
-                        # Pass through reassembler to extract inner frame
-                        if self._reassembler:
-                            self._reassembler.feed(accumulated[idx:])
-                    except Exception:
-                        pass
-                # Also set result with raw bytes after a short delay (let reassembler process first)
                 response_future.set_result(accumulated)
+                # Also feed to reassembler for frame extraction
+                idx = accumulated.find(b"\xaa")
+                if idx >= 0 and self._reassembler:
+                    self._reassembler.feed(accumulated[idx:])
             else:
-                # Feed to reassembler if response already captured
                 if self._reassembler:
                     self._reassembler.feed(bytes(data))
         
@@ -402,8 +395,14 @@ class WhoopBleClient:
 
         try:
             # Subscribe to cmd notify with our capture callback
+            # Stop first — Bleak requires unsubscribing before changing callback
+            try:
+                await self._ble_client.stop_notify(notify_uuid)
+            except Exception:
+                pass
             await self._ble_client.start_notify(notify_uuid, _capture_response)
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.5)
+            logger.debug("Re-subscribed CMD notify for command capture")
 
             # Write command
             try:
@@ -424,8 +423,12 @@ class WhoopBleClient:
             logger.error("Command failed: %s", exc)
             return None
         finally:
-            # Restore original notification handler and reassembler callback
+            # Restore original notification handler
             if self._ble_client and self._ble_client.is_connected:
+                try:
+                    await self._ble_client.stop_notify(notify_uuid)
+                except Exception:
+                    pass
                 try:
                     await self._ble_client.start_notify(notify_uuid, self._on_notification)
                 except Exception:
