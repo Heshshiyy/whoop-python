@@ -441,8 +441,8 @@ class WhoopBleClient:
     # ------------------------------------------------------------------
 
     async def start_realtime_hr(self) -> bool:
-        """Subscribe to HR notifications via the event characteristic.
-
+        """Subscribe to HR notifications and start the realtime stream.
+        
         Returns True on success.
         """
         if self._ble_client is None or not self._ble_client.is_connected:
@@ -451,15 +451,42 @@ class WhoopBleClient:
             return False
 
         try:
+            # Subscribe to standard BLE Heart Rate characteristic (0x2A37)
+            await self._ble_client.start_notify(
+                "00002a37-0000-1000-8000-00805f9b34fb",
+                self._on_notification,
+            )
+            logger.info("Standard HR notifications enabled (0x2A37)")
+        except Exception as exc:
+            logger.debug("Standard HR notify failed: %s", exc)
+        
+        try:
+            # Subscribe to WHOOP event and data channels
             await self._ble_client.start_notify(
                 self._family.event_notify_uuid,
                 self._on_notification,
             )
-            logger.info("Realtime HR notifications enabled")
-            return True
+            await self._ble_client.start_notify(
+                self._family.data_notify_uuid,
+                self._on_notification,
+            )
+            logger.info("WHOOP event/data notifications enabled")
         except Exception as exc:
-            logger.error("Failed to start HR notifications: %s", exc)
+            logger.error("Failed to start WHOOP notifications: %s", exc)
             return False
+        
+        # Send TOGGLE_REALTIME_HR (cmd 3) with 0x01 to start HR streaming
+        try:
+            from whoop.protocol.commands import Command
+            start_hr = Command.TOGGLE_REALTIME_HR.build_frame(
+                seq=0, payload=b"\x01", family=self._family
+            )
+            await self.send_command(start_hr)
+            logger.info("Realtime HR streaming started")
+        except Exception as exc:
+            logger.debug("TOGGLE_REALTIME_HR failed (non-fatal): %s", exc)
+        
+        return True
 
     async def start_data_stream(self) -> bool:
         """Subscribe to the WHOOP data notification channel.
@@ -499,15 +526,22 @@ class WhoopBleClient:
                 pass
 
     async def read_battery(self) -> BatteryInfo | None:
-        """Read battery level via command and return BatteryInfo."""
-        from whoop.protocol.commands import Command
-        resp = await self.send_command(
-            Command.GET_BATTERY_LEVEL.build_frame(seq=0, payload=b"", family=self._family)
-        )
-        if resp is not None and len(resp) > 3:
-            level = resp[3] if len(resp) > 3 else 0
-            charging = resp[4] > 0 if len(resp) > 4 else False
-            return BatteryInfo(level=level, is_charging=charging)
+        """Read battery level via standard BLE Battery Service (0x180F/0x2A19).
+        
+        The WHOOP strap exposes battery through the standard BLE Battery Service
+        characteristic which can be read directly without sending WHOOP commands.
+        """
+        STANDARD_BATTERY_UUID = "00002a19-0000-1000-8000-00805f9b34fb"
+        if self._ble_client is None or not self._ble_client.is_connected:
+            return None
+        try:
+            data = await self._ble_client.read_gatt_char(STANDARD_BATTERY_UUID)
+            if data and len(data) > 0:
+                level = data[0]
+                charging = data[1] > 0 if len(data) > 1 else False
+                return BatteryInfo(level=level, is_charging=charging)
+        except Exception as e:
+            logger.debug("Standard battery read failed: %s", e)
         return None
 
     # ------------------------------------------------------------------
