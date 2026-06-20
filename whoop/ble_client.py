@@ -363,51 +363,59 @@ class WhoopBleClient:
         char_uuid = self._family.cmd_char_uuid
         notify_uuid = self._family.cmd_notify_uuid
 
-        # Queue to capture the response
+        # Queue to capture the response — raw bytes from CMD notify
         response_future: asyncio.Future[bytes] = asyncio.get_event_loop().create_future()
+        raw_chunks: list[bytes] = []
+        
+        def _capture_response(_sender: int, data: bytearray) -> None:
+            raw = bytes(data)
+            logger.debug("CMD notify raw: %d bytes: %s", len(raw), raw.hex()[:80])
+            if not response_future.done():
+                raw_chunks.append(raw)
+                # Try to extract a frame from accumulated data
+                accumulated = b"".join(raw_chunks)
+                # Look for SOF-delimited frame
+                idx = accumulated.find(b"\xaa")
+                if idx >= 0:
+                    try:
+                        # Pass through reassembler to extract inner frame
+                        if self._reassembler:
+                            self._reassembler.feed(accumulated[idx:])
+                    except Exception:
+                        pass
+                # Also set result with raw bytes after a short delay (let reassembler process first)
+                response_future.set_result(accumulated)
+            else:
+                # Feed to reassembler if response already captured
+                if self._reassembler:
+                    self._reassembler.feed(bytes(data))
+        
+        # Capture via reassembler too
+        def _on_frame_capture(inner: bytes) -> None:
+            logger.debug("Reassembler produced frame: %d bytes", len(inner))
+            if not response_future.done():
+                response_future.set_result(inner)
+
         original_on_frame = self._reassembler.on_frame if self._reassembler else None
-
-        def _capture_response(inner: bytes) -> None:
-            if response_future.done():
-                if original_on_frame:
-                    original_on_frame(inner)
-                return
-            try:
-                parsed = parse_frame(inner, self._family)
-                if isinstance(parsed, ParsedFrame) and parsed.packet_type in (
-                    PacketTypes.COMMAND_RESPONSE,
-                    PacketTypes.PUFFIN_COMMAND_RESPONSE,
-                ):
-                    response_future.set_result(inner)
-                    return
-            except Exception:
-                pass
-            if original_on_frame:
-                original_on_frame(inner)
-
         if self._reassembler:
-            self._reassembler.on_frame = _capture_response
+            self._reassembler.on_frame = _on_frame_capture
 
         try:
-            # Notifications should already be subscribed from _trigger_bond.
-            # If they weren't, subscribe now.
-            if not self._bonded:
-                try:
-                    await self._ble_client.start_notify(notify_uuid, self._on_notification)
-                    await asyncio.sleep(0.3)
-                except Exception:
-                    pass
+            # Subscribe to cmd notify with our capture callback
+            await self._ble_client.start_notify(notify_uuid, _capture_response)
+            await asyncio.sleep(0.3)
 
-            # Write command (response=True was already used for bonding; this write
-            # should succeed normally now)
+            # Write command
             try:
                 await self._ble_client.write_gatt_char(char_uuid, frame, response=True)
-            except Exception:
-                # Fallback: try without response if bonded
+                logger.debug("Command written successfully")
+            except Exception as e:
+                logger.debug("Write with response failed (%s), trying without...", e)
                 await self._ble_client.write_gatt_char(char_uuid, frame, response=False)
 
             # Wait for response
             result = await asyncio.wait_for(response_future, timeout=10.0)
+            logger.debug("Command response captured: %d bytes", len(result))
             return result
         except asyncio.TimeoutError:
             logger.warning("Command response timeout")
@@ -416,6 +424,12 @@ class WhoopBleClient:
             logger.error("Command failed: %s", exc)
             return None
         finally:
+            # Restore original notification handler and reassembler callback
+            if self._ble_client and self._ble_client.is_connected:
+                try:
+                    await self._ble_client.start_notify(notify_uuid, self._on_notification)
+                except Exception:
+                    pass
             if self._reassembler:
                 self._reassembler.on_frame = original_on_frame
 
