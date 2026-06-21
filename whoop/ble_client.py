@@ -830,42 +830,94 @@ class WhoopBleClient:
                 print("  [history] WARNING: STOP_RAW got no response — CMD channel may not be ready")
                 logger.warning("get_history: STOP_RAW timed out — proceeding anyway")
 
-            # Swap _collect onto reassembler NOW — just before SEND_HISTORICAL_DATA
-            # so we don't miss the first type-47 frame.
+            # Swap _collect onto reassembler NOW — just before the data commands
+            # so we don't miss a single type-47 frame.
             self._reassembler.on_frame = _collect  # type: ignore[assignment]
 
             # ----------------------------------------------------------------
-            # Step 5: SEND_HISTORICAL_DATA
-            # Payload: start_ts (u32 LE) + end_ts (u32 LE).
-            # MUST use response=False — WHOOP 4 firmware only handles
-            # ATT Write Command (write-without-response) at the app layer.
-            # response=True gets a BLE-level ACK but the strap ignores the cmd.
+            # Step 5: GET_DATA_RANGE then SEND_HISTORICAL_DATA
+            #
+            # GET_DATA_RANGE (cmd=34) via direct write (not send_command) so the
+            # reassembler stays on _collect and we capture any auto-flush that
+            # might follow it.
             # ----------------------------------------------------------------
-            print(f"  [history] step 5/5 — SEND_HISTORICAL_DATA (window={end_ts - start_ts}s)...")
+            print("  [history] step 5a — GET_DATA_RANGE (direct write, watching 3s)...")
             self._seq = (self._seq + 1) & 0xFF
-            hist_payload = struct.pack("<II", start_ts, end_ts)
-            hist_frame = Command.SEND_HISTORICAL_DATA.build_frame(
-                seq=self._seq, payload=hist_payload, family=self._family
+            rng_frame = Command.GET_DATA_RANGE.build_frame(
+                seq=self._seq, payload=b"", family=self._family
             )
-            await self._ble_client.write_gatt_char(char_uuid, hist_frame, response=False)
-            print(f"  [history] waiting up to {timeout:.0f}s for type-47 historical frames...")
-            logger.info(
-                "get_history: sent SEND_HISTORICAL_DATA start=%d end=%d (window=%ds)",
-                start_ts, end_ts, end_ts - start_ts,
-            )
+            await self._ble_client.write_gatt_char(char_uuid, rng_frame, response=False)
+            await asyncio.sleep(3.0)
+            print(f"  [history]   → after GET_DATA_RANGE: {frame_count[0]} frame(s) received")
 
-            # Step 3: Wait for HISTORY_END/COMPLETE metadata frame.
-            try:
-                await asyncio.wait_for(done_event.wait(), timeout=timeout)
-            except asyncio.TimeoutError:
+            if done_event.is_set():
+                # History completed automatically — nothing else needed
+                return records
+
+            # ----------------------------------------------------------------
+            # SEND_HISTORICAL_DATA — try three payload formats in order.
+            # We don't know the exact wire format for cmd=22 on WHOOP 4, so
+            # probe each one with a 15s window and stop on first data.
+            #
+            # Format A: empty  — "send all pending unsynced records"
+            # Format B: 4 bytes start_ts u32 LE — "send from this timestamp"
+            # Format C: 8 bytes start_ts + end_ts u32 LE each (original attempt)
+            # ----------------------------------------------------------------
+            payloads = [
+                (b"",                                          "A: empty (send all pending)"),
+                (struct.pack("<I", start_ts),                 "B: start_ts only (4 bytes)"),
+                (struct.pack("<II", start_ts, end_ts),        "C: start+end timestamps (8 bytes)"),
+            ]
+
+            per_attempt_timeout = min(15.0, timeout / max(len(payloads), 1))
+            remaining_timeout = timeout - 3.0  # already spent 3s on GET_DATA_RANGE
+
+            for payload_bytes, payload_desc in payloads:
+                if done_event.is_set() or frame_count[0] > 0:
+                    break
+                if remaining_timeout <= 0:
+                    break
+
+                self._seq = (self._seq + 1) & 0xFF
+                hist_frame = Command.SEND_HISTORICAL_DATA.build_frame(
+                    seq=self._seq, payload=payload_bytes, family=self._family
+                )
+                await self._ble_client.write_gatt_char(char_uuid, hist_frame, response=False)
+                print(f"  [history] step 5b — SEND_HISTORICAL_DATA format {payload_desc}...")
+                logger.info(
+                    "get_history: SEND_HISTORICAL_DATA payload=%s (%d bytes)",
+                    payload_desc, len(payload_bytes),
+                )
+
+                wait_secs = min(per_attempt_timeout, remaining_timeout)
+                try:
+                    await asyncio.wait_for(done_event.wait(), timeout=wait_secs)
+                    break  # got HISTORY_END
+                except asyncio.TimeoutError:
+                    remaining_timeout -= wait_secs
+                    frames_now = frame_count[0]
+                    print(f"  [history]   → {frames_now} frame(s) in {wait_secs:.0f}s — trying next format")
+
+            if not done_event.is_set() and frame_count[0] == 0:
                 print(
-                    f"  [history] timed out after {timeout:.0f}s — "
+                    f"  [history] all formats exhausted with 0 frames — "
+                    f"strap may not support BLE historical offload with these commands"
+                )
+            elif frame_count[0] > 0 and not done_event.is_set():
+                # Got some frames but no HISTORY_END — wait out remaining time
+                remaining = timeout - 3.0 - len(payloads) * per_attempt_timeout
+                if remaining > 0:
+                    try:
+                        await asyncio.wait_for(done_event.wait(), timeout=remaining)
+                    except asyncio.TimeoutError:
+                        pass
+                print(
+                    f"  [history] timed out — "
                     f"received {frame_count[0]} frames, {len(records)} records"
                 )
                 logger.warning(
-                    "get_history timed out after %.0fs — "
-                    "received %d frames, %d records",
-                    timeout, frame_count[0], len(records),
+                    "get_history timed out — received %d frames, %d records",
+                    frame_count[0], len(records),
                 )
 
             # Step 4: ACK — tell strap we received data up to end_ts.
