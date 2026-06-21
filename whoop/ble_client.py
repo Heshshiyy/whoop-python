@@ -779,9 +779,10 @@ class WhoopBleClient:
             # Step 0: SET_CLOCK — strap requires time sync before historical offload
             import time as _time
             from whoop.protocol.handshake import build_clock_payload
+            now = int(_time.time())
             self._seq = (self._seq + 1) & 0xFF
             clock_frame = Command.SET_CLOCK.build_frame(
-                seq=self._seq, payload=build_clock_payload(), family=self._family
+                seq=self._seq, payload=build_clock_payload(now), family=self._family
             )
             resp = await self.send_command(clock_frame)
             logger.info("get_history: SET_CLOCK %s", "ack" if resp else "no response (non-fatal)")
