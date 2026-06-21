@@ -201,14 +201,17 @@ class WhoopBleClient:
         self._set_state(ConnectionState.CONNECTING)
 
         try:
-            device = BLEDevice(address=address, name="WHOOP", details=None, rssi=0)
-            self._device = device
+            # Use address string directly — idiomatic WinRT path (find_device_by_address
+            # internally uses FromBluetoothAddressAsync which sets up the session properly).
+            # BLEDevice(details=None) works on newer Bleak but address-string is safer.
             self._ble_client = BleakClient(
-                device,
+                address,
                 disconnected_callback=self._on_ble_disconnect,
                 timeout=timeout,
             )
             await self._ble_client.connect()
+            # Stash a lightweight device reference (for reconnect).
+            self._device = BLEDevice(address=address, name="WHOOP", details=None, rssi=0)
             
             self._bonded = False
             
@@ -226,14 +229,19 @@ class WhoopBleClient:
             return False
 
     async def _trigger_bond(self) -> None:
-        """Trigger just-works bonding by writing GET_BATTERY_LEVEL to the CMD characteristic.
-        
+        """Trigger just-works bonding by writing SET_CLOCK to the CMD characteristic.
+
         WHOOP 4.0 requires bonding before it will respond to commands. The bond flow:
         1. Write to CMD char → strap rejects with "Insufficient Authentication"
         2. Windows BLE stack triggers just-works pairing (no PIN)
         3. Connection drops during pairing
         4. Reconnect (now bonded)
         5. Re-subscribe to notifications
+
+        We deliberately use SET_CLOCK (not GET_BATTERY_LEVEL) here so that
+        read_battery() can send GET_BATTERY_LEVEL fresh and get the strap's first
+        response for that command — the strap ignores a second GET_BATTERY_LEVEL
+        in the same connection.
         """
         from whoop.protocol.commands import Command
         if self._ble_client is None or self._family is None:
@@ -243,53 +251,83 @@ class WhoopBleClient:
         char_uuid = self._family.cmd_char_uuid
         address = self._device.address if self._device else ""
         
-        # Step 1: Subscribe to notifications and trigger bond
-        try:
-            await self._ble_client.start_notify(notify_uuid, self._on_notification)
-            await asyncio.sleep(0.5)
-            logger.debug("Subscribed to CMD notify")
-        except Exception as e:
-            logger.warning("Could not subscribe to notify: %s", e)
+        # Step 1: Subscribe to ALL proprietary notify characteristics.
+        # 61080007 is present on WHOOP 4 straps as an aux notify channel —
+        # subscribe to it too in case responses land there.
+        _aux_uuids = [
+            notify_uuid,
+            self._family.event_notify_uuid,
+            self._family.data_notify_uuid,
+        ]
+        # 61080007 (aux) — present on WHOOP 4 even though family.aux_notify_uuid=None
+        _whoop4_aux = "61080007-8d6d-82b8-614a-1c8cb0f8dcc6"
+        if self._family.aux_notify_uuid:
+            _aux_uuids.append(self._family.aux_notify_uuid)
+        elif self._family.is_whoop4:
+            _aux_uuids.append(_whoop4_aux)
+
+        subscribed_any = False
+        for _uuid in _aux_uuids:
+            try:
+                await self._ble_client.start_notify(_uuid, self._on_notification)
+                subscribed_any = True
+                logger.debug("Subscribed to %s", _uuid)
+            except Exception as e:
+                logger.debug("Could not subscribe to %s: %s", _uuid, e)
+
+        if not subscribed_any:
+            logger.warning("Could not subscribe to any notify characteristic")
             return
-        
-        frame = Command.GET_BATTERY_LEVEL.build_frame(seq=0, payload=b"", family=self._family)
-        
+
+        await asyncio.sleep(0.3)
+
+        import time as _time
+        _now = int(_time.time())
+        _clock_payload = _now.to_bytes(4, "little") + b"\x00\x00\x00\x00"
+        frame = Command.SET_CLOCK.build_frame(seq=0, payload=_clock_payload, family=self._family)
+
         for attempt in range(3):
             try:
-                logger.debug("Bond attempt %d: writing to CMD char...", attempt + 1)
-                await self._ble_client.write_gatt_char(char_uuid, frame, response=True)
+                logger.debug("Bond attempt %d: writing to CMD char (write-without-response)...", attempt + 1)
+                # Use write-without-response (response=False) — the WHOOP command
+                # characteristic lists write-without-response FIRST in its properties,
+                # meaning the firmware's command handler is on that ATT path.
+                # response=True writes get BLE-layer ACKed but the app layer ignores them.
+                await self._ble_client.write_gatt_char(char_uuid, frame, response=False)
                 self._bonded = True
-                logger.info("Bond established — command accepted")
+                logger.info("Bond established — command written (write-without-response)")
                 return
             except Exception as e:
                 msg = str(e)
                 logger.debug("Bond attempt %d error: %s", attempt + 1, msg)
-                
+
                 if "Insufficient Authentication" in msg or "Insufficient Encryption" in msg:
                     logger.info("Bonding triggered — waiting for Windows pairing to complete...")
                     await asyncio.sleep(5.0)
-                    
-                    # Connection may have dropped — try to reconnect
+
                     try:
                         await self._ble_client.disconnect()
                     except Exception:
                         pass
-                    
+
                     logger.debug("Reconnecting after pairing...")
                     try:
                         self._ble_client = BleakClient(
-                            self._device or address,
+                            address,
                             disconnected_callback=self._on_ble_disconnect,
                             timeout=15.0,
                         )
                         await self._ble_client.connect()
-                        logger.debug("Reconnected — re-subscribing notify")
-                        await self._ble_client.start_notify(notify_uuid, self._on_notification)
-                        await asyncio.sleep(0.5)
-                        
-                        # Try the write again on the new connection
+                        logger.debug("Reconnected — re-subscribing notify channels")
+                        for _uuid in _aux_uuids:
+                            try:
+                                await self._ble_client.start_notify(_uuid, self._on_notification)
+                            except Exception:
+                                pass
+                        await asyncio.sleep(0.3)
+
                         try:
-                            await self._ble_client.write_gatt_char(char_uuid, frame, response=True)
+                            await self._ble_client.write_gatt_char(char_uuid, frame, response=False)
                             self._bonded = True
                             logger.info("Bond established after reconnect")
                             return
@@ -297,9 +335,9 @@ class WhoopBleClient:
                             logger.debug("Write after reconnect failed: %s", e2)
                     except Exception as e3:
                         logger.debug("Reconnect failed: %s", e3)
-                    
-                    continue  # Retry
-                    
+
+                    continue
+
                 elif "Protocol Error" in msg:
                     logger.debug("Protocol error — retrying in 2s")
                     await asyncio.sleep(2.0)
@@ -309,20 +347,24 @@ class WhoopBleClient:
                     await asyncio.sleep(3.0)
                     try:
                         self._ble_client = BleakClient(
-                            self._device or address,
+                            address,
                             disconnected_callback=self._on_ble_disconnect,
                             timeout=15.0,
                         )
                         await self._ble_client.connect()
-                        await self._ble_client.start_notify(notify_uuid, self._on_notification)
-                        await asyncio.sleep(0.5)
+                        for _uuid in _aux_uuids:
+                            try:
+                                await self._ble_client.start_notify(_uuid, self._on_notification)
+                            except Exception:
+                                pass
+                        await asyncio.sleep(0.3)
                         continue
                     except Exception:
                         break
                 else:
                     logger.warning("Unexpected bonding error: %s", e)
                     break
-        
+
         logger.warning("Bonding did not complete after 3 attempts")
 
     async def disconnect(self) -> None:
@@ -350,7 +392,11 @@ class WhoopBleClient:
     async def send_command(self, frame: bytes) -> bytes | None:
         """Send a raw command frame and await the response.
 
-        Returns the response payload bytes, or None on failure.
+        Does NOT stop/start notify — keeps the existing _on_notification
+        subscription intact and routes the decoded response through the
+        FrameReassembler via a temporary on_frame swap.
+
+        Returns the decoded inner-frame bytes, or None on failure/timeout.
         """
         if self._ble_client is None or not self._ble_client.is_connected:
             logger.error("Cannot send command: not connected")
@@ -361,32 +407,9 @@ class WhoopBleClient:
             return None
 
         char_uuid = self._family.cmd_char_uuid
-        notify_uuid = self._family.cmd_notify_uuid
 
-        # Queue to capture the response — raw bytes from CMD notify
         response_future: asyncio.Future[bytes] = asyncio.get_event_loop().create_future()
-        raw_chunks: list[bytes] = []
-        capture_ready: bool = False  # Set True after command write, skip stale
-        
-        def _capture_response(_sender: int, data: bytearray) -> None:
-            raw = bytes(data)
-            logger.debug("CMD notify raw: %d bytes: %s", len(raw), raw.hex()[:80])
-            if not capture_ready:
-                logger.debug("Discarding stale notification (pre-command)")
-                return
-            raw_chunks.append(raw)
-            if not response_future.done():
-                accumulated = b"".join(raw_chunks)
-                if self._reassembler:
-                    self._reassembler.feed(accumulated)
-                def _set_result():
-                    if not response_future.done():
-                        response_future.set_result(accumulated)
-                asyncio.get_event_loop().call_later(0.2, _set_result)
-            else:
-                if self._reassembler:
-                    self._reassembler.feed(bytes(data))
-        
+
         def _on_frame_capture(inner: bytes) -> None:
             logger.debug("Reassembler produced frame: %d bytes", len(inner))
             if not response_future.done():
@@ -397,50 +420,26 @@ class WhoopBleClient:
             self._reassembler.on_frame = _on_frame_capture
 
         try:
-            # Subscribe to cmd notify with our capture callback
-            # Stop first — Bleak requires unsubscribing before changing callback
+            # Write-without-response first: WHOOP 4 command char lists this path
+            # first in properties, and the firmware command handler is on this path.
+            # response=True gets BLE-ACKed but the strap never fires a notification reply.
             try:
-                await self._ble_client.stop_notify(notify_uuid)
-            except Exception:
-                pass
-            await self._ble_client.start_notify(notify_uuid, _capture_response)
-            await asyncio.sleep(0.5)
-            logger.debug("Re-subscribed CMD notify for command capture")
-            
-            # Flush stale notifications (residual data from bonding)
-            await asyncio.sleep(0.2)
-            capture_ready = True
-            logger.debug("Now capturing fresh command response")
-            
-            # Write command
-            try:
-                await self._ble_client.write_gatt_char(char_uuid, frame, response=True)
-                logger.debug("Command written successfully")
-            except Exception as e:
-                logger.debug("Write with response failed (%s), trying without...", e)
                 await self._ble_client.write_gatt_char(char_uuid, frame, response=False)
+                logger.debug("Command written (write-without-response)")
+            except Exception as e:
+                logger.debug("Write without response failed (%s), retrying with response...", e)
+                await self._ble_client.write_gatt_char(char_uuid, frame, response=True)
 
-            # Wait for fresh response
-            result = await asyncio.wait_for(response_future, timeout=10.0)
+            result = await asyncio.wait_for(response_future, timeout=5.0)
             logger.debug("Command response captured: %d bytes", len(result))
             return result
         except asyncio.TimeoutError:
-            logger.warning("Command response timeout")
+            logger.debug("Command response timeout (write landed, no notify reply)")
             return None
         except Exception as exc:
             logger.error("Command failed: %s", exc)
             return None
         finally:
-            # Restore original notification handler
-            if self._ble_client and self._ble_client.is_connected:
-                try:
-                    await self._ble_client.stop_notify(notify_uuid)
-                except Exception:
-                    pass
-                try:
-                    await self._ble_client.start_notify(notify_uuid, self._on_notification)
-                except Exception:
-                    pass
             if self._reassembler:
                 self._reassembler.on_frame = original_on_frame
 
@@ -471,20 +470,29 @@ class WhoopBleClient:
         except Exception as exc:
             logger.debug("Standard HR notify failed (non-fatal): %s", exc)
         
-        # Step 2: Subscribe to WHOOP event and data channels
-        try:
-            await self._ble_client.start_notify(
-                self._family.event_notify_uuid,
-                self._on_notification,
-            )
-            await self._ble_client.start_notify(
-                self._family.data_notify_uuid,
-                self._on_notification,
-            )
-            logger.info("WHOOP event/data notifications enabled")
-        except Exception as exc:
-            logger.error("Failed to start WHOOP notifications: %s", exc)
+        # Step 2: Subscribe to WHOOP event, data, and aux channels
+        _whoop_notify_uuids = [
+            self._family.event_notify_uuid,
+            self._family.data_notify_uuid,
+        ]
+        if self._family.aux_notify_uuid:
+            _whoop_notify_uuids.append(self._family.aux_notify_uuid)
+        elif self._family.is_whoop4:
+            # 61080007 is present on WHOOP 4 straps even though aux_notify_uuid=None
+            _whoop_notify_uuids.append("61080007-8d6d-82b8-614a-1c8cb0f8dcc6")
+
+        subscribed = 0
+        for _uuid in _whoop_notify_uuids:
+            try:
+                await self._ble_client.start_notify(_uuid, self._on_notification)
+                subscribed += 1
+            except Exception as exc:
+                logger.debug("Could not subscribe to %s (non-fatal): %s", _uuid, exc)
+
+        if subscribed == 0:
+            logger.error("Failed to start any WHOOP proprietary notifications")
             return False
+        logger.info("WHOOP proprietary notifications enabled (%d channels)", subscribed)
         
         # Step 3: Run WHOOP 4.0 handshake sequence
         import time as _time
@@ -582,74 +590,90 @@ class WhoopBleClient:
             except Exception:
                 pass
 
-    async def _wake_battery_reporting(self) -> None:
-        """Wake the strap's battery reporting by cycling CMD notify + writing a command.
-        
-        On WHOOP 4.0, the standard BLE Battery Service (0x2A19) returns a stale
-        value (usually 100%) until:
-        1. The CMD notify subscription is cycled (stop → start)
-        2. A command is written to the CMD characteristic (write_gatt_char)
-        
-        Both steps are required. Discovered empirically: commit 01034b4 (which
-        did both) showed 18% correct; all other commits (missing one step)
-        showed 100% stale.
-        """
-        if not self._ble_client or not self._family:
-            return
-        
-        from whoop.protocol.commands import Command
-        
-        # Step 1: Cycle CMD notify subscription
-        try:
-            await self._ble_client.stop_notify(self._family.cmd_notify_uuid)
-        except Exception:
-            pass
-        try:
-            await self._ble_client.start_notify(
-                self._family.cmd_notify_uuid, self._on_notification
-            )
-            await asyncio.sleep(0.3)
-        except Exception as e:
-            logger.debug("Battery notify cycle failed: %s", e)
-            return
-        
-        # Step 2: Write a command to wake battery reporting
-        # GET_BATTERY_LEVEL triggers the strap to update its battery value
-        try:
-            frame = Command.GET_BATTERY_LEVEL.build_frame(
-                seq=0, payload=b"", family=self._family
-            )
-            await self._ble_client.write_gatt_char(
-                self._family.cmd_char_uuid, frame, response=True
-            )
-            await asyncio.sleep(0.3)
-        except Exception as e:
-            logger.debug("Battery wake command failed (non-fatal): %s", e)
-
     async def read_battery(self) -> BatteryInfo | None:
-        """Read battery level from standard BLE Battery Service (0x2A19).
-        
-        Requires a CMD notify subscription cycle to wake the battery reporting
-        (see _wake_battery_reporting).
+        """Read battery level via the WHOOP proprietary GET_BATTERY_LEVEL command.
+
+        The diagnostic (whoop_ble_diag.py) confirmed:
+        - 0x2A19 uncached read returns 10% while the WHOOP app shows 50% — it is
+          NOT the real battery source on WHOOP 4.
+        - WinRT routing works (0x2A37 HR delivers fine).
+        - 61080003/0004/0005/0007 are completely silent when written with response=True.
+
+        Primary fix applied here and in send_command: use write-without-response
+        (response=False) — the WHOOP 4 command characteristic lists that write type
+        first, meaning the firmware command handler is on that ATT path.
+
+        Battery parsing: the GET_BATTERY_LEVEL (cmd 26) response arrives as a
+        CommandResponse inner record. We log the full raw bytes on first run so we
+        can identify the exact offset; best guesses are tried in order.
+        Falls back to 0x2A19 read if no proprietary response arrives.
         """
         if not self._ble_client or not self._ble_client.is_connected:
             return None
-        
-        # Wake battery reporting by cycling CMD notify subscription
-        await self._wake_battery_reporting()
-        
-        # Read standard BLE Battery Service
+        if not self._family:
+            return None
+
+        from whoop.protocol.commands import Command
+
+        # ── Primary: send GET_BATTERY_LEVEL, capture response ───────────────
+        # Ensure all proprietary notify channels are subscribed so the response
+        # is routed through the reassembler regardless of which UUID carries it.
+        _notify_uuids = [
+            self._family.cmd_notify_uuid,
+            self._family.event_notify_uuid,
+            self._family.data_notify_uuid,
+        ]
+        _whoop4_aux = "61080007-8d6d-82b8-614a-1c8cb0f8dcc6"
+        if self._family.aux_notify_uuid:
+            _notify_uuids.append(self._family.aux_notify_uuid)
+        elif self._family.is_whoop4:
+            _notify_uuids.append(_whoop4_aux)
+
+        for _uuid in _notify_uuids:
+            try:
+                await self._ble_client.start_notify(_uuid, self._on_notification)
+            except Exception:
+                pass  # already subscribed or not present — non-fatal
+
+        # Build GET_BATTERY_LEVEL frame and send via send_command (which uses
+        # write-without-response now that the write order has been corrected).
+        self._seq = (self._seq + 1) & 0xFF
+        batt_frame = Command.GET_BATTERY_LEVEL.build_frame(
+            seq=self._seq, payload=b"", family=self._family
+        )
+
+        raw_inner = await self.send_command(batt_frame)
+
+        if raw_inner is not None:
+            logger.debug("GET_BATTERY_LEVEL response raw: %s", raw_inner.hex())
+            print(f"  [battery] GET_BATTERY_LEVEL response ({len(raw_inner)} bytes): {raw_inner.hex()}")
+            # Parse: inner = [type, seq, cmd, payload...]
+            # Try the most common offsets for battery % in WHOOP responses.
+            # Log everything so we can identify the right offset.
+            for offset in (3, 4, 6, 7):
+                if offset < len(raw_inner):
+                    val = raw_inner[offset]
+                    print(f"  [battery] offset {offset} = {val} (0x{val:02x})")
+                    if 0 < val <= 100:
+                        logger.info("Battery from GET_BATTERY_LEVEL (offset %d): %d%%", offset, val)
+                        return BatteryInfo(level=val, is_charging=False)
+            # If no plausible value found at common offsets, log and fall through.
+            logger.warning("GET_BATTERY_LEVEL response received but no value 1-100 found at offsets 3/4/6/7")
+
+        # ── Fallback: 0x2A19 direct read ────────────────────────────────────
+        # Known to return a stale/strap-internal value that doesn't match the
+        # WHOOP app, but better than returning None.
+        BATT_UUID = "00002a19-0000-1000-8000-00805f9b34fb"
         try:
-            data = await self._ble_client.read_gatt_char(
-                "00002a19-0000-1000-8000-00805f9b34fb"
-            )
+            data = await self._ble_client.read_gatt_char(BATT_UUID, use_cached=False)
             if data and len(data) > 0:
                 level = data[0]
-                logger.debug("Battery: %d%%", level)
+                logger.debug("Battery (0x2A19 fallback): %d%%", level)
+                print(f"  [battery] 0x2A19 fallback: {level}%")
                 return BatteryInfo(level=level, is_charging=False)
         except Exception as e:
-            logger.debug("Standard battery read failed: %s", e)
-        
+            logger.debug("Battery 0x2A19 read failed: %s", e)
+
         return None
 
     # ------------------------------------------------------------------
