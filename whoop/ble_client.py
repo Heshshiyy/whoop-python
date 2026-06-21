@@ -758,10 +758,22 @@ class WhoopBleClient:
                 )
             elif isinstance(parsed, Metadata):
                 logger.info("Metadata: %s", parsed.metadata_kind)
-                if parsed.metadata_kind in (
-                    MetadataKind.HISTORY_END,
-                    MetadataKind.HISTORY_COMPLETE,
-                ):
+                if parsed.metadata_kind == MetadataKind.HISTORY_END:
+                    # Per-chunk ACK: send HISTORICAL_DATA_RESULT with this chunk's end_data.
+                    # end_data is a u64 LE embedded in the metadata payload at offset 2.
+                    # Schedule as async task since _collect is synchronous.
+                    if hasattr(parsed, 'payload') and parsed.payload and len(parsed.payload) >= 10:
+                        end_data = int.from_bytes(parsed.payload[2:10], 'little')
+                        async def _ack_chunk(end_ts_val: int):
+                            self._seq = (self._seq + 1) & 0xFF
+                            ack = struct.pack("<BQ", 0x01, end_ts_val)
+                            ack_frame = Command.HISTORICAL_DATA_RESULT.build_frame(
+                                seq=self._seq, payload=ack, family=self._family
+                            )
+                            await self._ble_client.write_gatt_char(char_uuid, ack_frame, response=True)
+                            logger.info("Chunk ACK: end_data=%d", end_ts_val)
+                        asyncio.ensure_future(_ack_chunk(end_data))
+                elif parsed.metadata_kind in (MetadataKind.HISTORY_COMPLETE,):
                     logger.info("History transfer complete — %d records", len(records))
                     done_event.set()
             elif isinstance(parsed, CommandResponse):
@@ -835,82 +847,38 @@ class WhoopBleClient:
             self._reassembler.on_frame = _collect  # type: ignore[assignment]
 
             # ----------------------------------------------------------------
-            # Step 5: GET_DATA_RANGE then SEND_HISTORICAL_DATA
+            # Step 5: Turn off live HR stream, then SEND_HISTORICAL_DATA.
             #
-            # GET_DATA_RANGE (cmd=34) via direct write (not send_command) so the
-            # reassembler stays on _collect and we capture any auto-flush that
-            # might follow it.
+            # CRITICAL: SEND_HISTORICAL_DATA payload MUST be [0x00] (single
+            # zero byte) — verified on NOOP reference. NOT empty, NOT
+            # timestamps, NOT record indices. Confirmed write required.
+            #
+            # Per-chunk ACKing required: after each HISTORY_END metadata frame,
+            # send HISTORICAL_DATA_RESULT with [0x01] + end_data(8 bytes).
+            # Without this, the strap re-serves the same chunk forever.
             # ----------------------------------------------------------------
-            print("  [history] step 5a — GET_DATA_RANGE (direct write, watching 3s)...")
+            
+            # Turn off live HR before requesting history
             self._seq = (self._seq + 1) & 0xFF
-            rng_frame = Command.GET_DATA_RANGE.build_frame(
-                seq=self._seq, payload=b"", family=self._family
+            print("  [history] step 5/5 — TOGGLE_REALTIME_HR OFF → SEND_HISTORICAL_DATA [0x00]...")
+            await self._ble_client.write_gatt_char(char_uuid,
+                Command.TOGGLE_REALTIME_HR.build_frame(
+                    seq=self._seq, payload=b"\x00", family=self._family
+                ), response=True)
+            
+            self._seq = (self._seq + 1) & 0xFF
+            hist_frame = Command.SEND_HISTORICAL_DATA.build_frame(
+                seq=self._seq, payload=b"\x00", family=self._family  # MUST be [0x00]
             )
-            await self._ble_client.write_gatt_char(char_uuid, rng_frame, response=False)
-            await asyncio.sleep(3.0)
-            print(f"  [history]   → after GET_DATA_RANGE: {frame_count[0]} frame(s) received")
+            await self._ble_client.write_gatt_char(char_uuid, hist_frame, response=True)
+            print(f"  [history] SEND_HISTORICAL_DATA sent [0x00] confirmed — waiting for type-47 frames...")
+            logger.info("get_history: SEND_HISTORICAL_DATA [0x00] confirmed write")
 
-            if done_event.is_set():
-                # History completed automatically — nothing else needed
-                return records
-
-            # ----------------------------------------------------------------
-            # SEND_HISTORICAL_DATA — try three payload formats in order.
-            # We don't know the exact wire format for cmd=22 on WHOOP 4, so
-            # probe each one with a 15s window and stop on first data.
-            #
-            # Format A: empty  — "send all pending unsynced records"
-            # Format B: 4 bytes start_ts u32 LE — "send from this timestamp"
-            # Format C: 8 bytes start_ts + end_ts u32 LE each (original attempt)
-            # ----------------------------------------------------------------
-            payloads = [
-                (b"",                                          "A: empty (send all pending)"),
-                (struct.pack("<I", start_ts),                 "B: start_ts only (4 bytes)"),
-                (struct.pack("<II", start_ts, end_ts),        "C: start+end timestamps (8 bytes)"),
-            ]
-
-            per_attempt_timeout = min(15.0, timeout / max(len(payloads), 1))
-            remaining_timeout = timeout - 3.0  # already spent 3s on GET_DATA_RANGE
-
-            for payload_bytes, payload_desc in payloads:
-                if done_event.is_set() or frame_count[0] > 0:
-                    break
-                if remaining_timeout <= 0:
-                    break
-
-                self._seq = (self._seq + 1) & 0xFF
-                hist_frame = Command.SEND_HISTORICAL_DATA.build_frame(
-                    seq=self._seq, payload=payload_bytes, family=self._family
-                )
-                await self._ble_client.write_gatt_char(char_uuid, hist_frame, response=False)
-                print(f"  [history] step 5b — SEND_HISTORICAL_DATA format {payload_desc}...")
-                logger.info(
-                    "get_history: SEND_HISTORICAL_DATA payload=%s (%d bytes)",
-                    payload_desc, len(payload_bytes),
-                )
-
-                wait_secs = min(per_attempt_timeout, remaining_timeout)
-                try:
-                    await asyncio.wait_for(done_event.wait(), timeout=wait_secs)
-                    break  # got HISTORY_END
-                except asyncio.TimeoutError:
-                    remaining_timeout -= wait_secs
-                    frames_now = frame_count[0]
-                    print(f"  [history]   → {frames_now} frame(s) in {wait_secs:.0f}s — trying next format")
-
-            if not done_event.is_set() and frame_count[0] == 0:
-                print(
-                    f"  [history] all formats exhausted with 0 frames — "
-                    f"strap may not support BLE historical offload with these commands"
-                )
-            elif frame_count[0] > 0 and not done_event.is_set():
-                # Got some frames but no HISTORY_END — wait out remaining time
-                remaining = timeout - 3.0 - len(payloads) * per_attempt_timeout
-                if remaining > 0:
-                    try:
-                        await asyncio.wait_for(done_event.wait(), timeout=remaining)
-                    except asyncio.TimeoutError:
-                        pass
+            # Step 6: Wait for HISTORY_END/COMPLETE metadata frame, ack each chunk.
+            try:
+                while not done_event.is_set():
+                    await asyncio.wait_for(done_event.wait(), timeout=min(30.0, timeout))
+            except asyncio.TimeoutError:
                 print(
                     f"  [history] timed out — "
                     f"received {frame_count[0]} frames, {len(records)} records"
@@ -920,14 +888,15 @@ class WhoopBleClient:
                     frame_count[0], len(records),
                 )
 
-            # Step 4: ACK — tell strap we received data up to end_ts.
+            # ACK — per-chunk ack handled by _collect via HISTORY_END detection.
+            # Final ack if we have records.
             if records:
                 ack_payload = build_ack_payload(end_ts)
                 self._seq = (self._seq + 1) & 0xFF
                 ack_frame = Command.HISTORICAL_DATA_RESULT.build_frame(
                     seq=self._seq, payload=ack_payload, family=self._family
                 )
-                await self._ble_client.write_gatt_char(char_uuid, ack_frame, response=False)
+                await self._ble_client.write_gatt_char(char_uuid, ack_frame, response=True)
                 logger.info("get_history: sent HISTORICAL_DATA_RESULT ACK")
 
             return records
