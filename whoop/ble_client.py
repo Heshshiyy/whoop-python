@@ -773,71 +773,95 @@ class WhoopBleClient:
             if original_on_frame is not None:
                 original_on_frame(inner)
 
-        self._reassembler.on_frame = _collect
+        # NOTE: _collect is NOT set on reassembler yet — send_command() calls below
+        # use their own temporary swap. We set _collect only just before
+        # SEND_HISTORICAL_DATA so no type-47 frames are missed.
 
         try:
-            # Step 0: SET_CLOCK — strap requires time sync before historical offload
             import time as _time
             from whoop.protocol.handshake import build_clock_payload
-            now = int(_time.time())
+
+            # ----------------------------------------------------------------
+            # Preamble — mirror start_realtime_hr() timing exactly.
+            #
+            # CRITICAL: the strap needs ~6-8 seconds after GET_HELLO_HARVARD
+            # before it responds to commands. In start_realtime_hr() this delay
+            # comes naturally from 3 × 2s send_command timeouts for commands
+            # that don't respond (ADV_NAME, SET_CLOCK, GET_CLOCK). We replicate
+            # that here so STOP_RAW arrives at the right time and gets a reply.
+            # ----------------------------------------------------------------
+            print("  [history] step 1/5 — GET_ADV_NAME (2s timeout)...")
             self._seq = (self._seq + 1) & 0xFF
-            clock_frame = Command.SET_CLOCK.build_frame(
-                seq=self._seq, payload=build_clock_payload(now), family=self._family
-            )
-            resp = await self.send_command(clock_frame)
-            logger.info("get_history: SET_CLOCK %s", "ack" if resp else "no response (non-fatal)")
-            
-            # Step 1: STOP_RAW — confirms CMD channel is active and stops any
-            # ongoing type-43 raw sensor flood before requesting history.
+            await self.send_command(
+                Command.GET_ADVERTISING_NAME_HARVARD.build_frame(
+                    seq=self._seq, payload=b"", family=self._family
+                )
+            )  # times out after 2s — expected
+
+            print("  [history] step 2/5 — SET_CLOCK (2s timeout)...")
+            self._seq = (self._seq + 1) & 0xFF
+            await self.send_command(
+                Command.SET_CLOCK.build_frame(
+                    seq=self._seq,
+                    payload=build_clock_payload(int(_time.time())),
+                    family=self._family,
+                )
+            )  # times out after 2s — expected
+
+            print("  [history] step 3/5 — GET_CLOCK (2s timeout)...")
+            self._seq = (self._seq + 1) & 0xFF
+            await self.send_command(
+                Command.GET_CLOCK.build_frame(
+                    seq=self._seq, payload=b"", family=self._family
+                )
+            )  # times out after 2s — expected
+
+            # ~6s have now elapsed since bond. STOP_RAW should get a response.
+            print("  [history] step 4/5 — STOP_RAW (confirms CMD channel open)...")
             self._seq = (self._seq + 1) & 0xFF
             stop_frame = Command.SEND_R10_R11_REALTIME.build_frame(
                 seq=self._seq, payload=b"\x00", family=self._family
             )
-            resp = await self.send_command(stop_frame)
-            if resp:
-                logger.info("get_history: STOP_RAW acknowledged")
+            stop_resp = await self.send_command(stop_frame)
+            if stop_resp:
+                print(f"  [history] CMD channel OPEN ✓ (STOP_RAW ack: {stop_resp.hex()})")
+                logger.info("get_history: STOP_RAW ack received")
             else:
-                logger.info("get_history: sent STOP_RAW (no ack) — waiting 2s")
-            await asyncio.sleep(2.0)
+                print("  [history] WARNING: STOP_RAW got no response — CMD channel may not be ready")
+                logger.warning("get_history: STOP_RAW timed out — proceeding anyway")
 
-            # Step 2: SEND_HISTORICAL_DATA — request the time window.
-            #   Try alternative payload formats in sequence.
-            #   Format A: record indices (start_idx u32, end_idx u32) — some firmware
-            #   Format B: timestamps (start_ts u32, end_ts u32)
-            #   The strap responds with a stream of type-47 HistoricalDataFrame
-            #   frames followed by a type-49 Metadata(HISTORY_END) frame.
-            
+            # Swap _collect onto reassembler NOW — just before SEND_HISTORICAL_DATA
+            # so we don't miss the first type-47 frame.
+            self._reassembler.on_frame = _collect  # type: ignore[assignment]
+
+            # ----------------------------------------------------------------
+            # Step 5: SEND_HISTORICAL_DATA
+            # Payload: start_ts (u32 LE) + end_ts (u32 LE).
+            # MUST use response=False — WHOOP 4 firmware only handles
+            # ATT Write Command (write-without-response) at the app layer.
+            # response=True gets a BLE-level ACK but the strap ignores the cmd.
+            # ----------------------------------------------------------------
+            print(f"  [history] step 5/5 — SEND_HISTORICAL_DATA (window={end_ts - start_ts}s)...")
             self._seq = (self._seq + 1) & 0xFF
-            
-            # Try Format A first: record indices (0 to max for "all records")
-            hist_payload = struct.pack("<II", 0, 0xFFFFFFFF)
+            hist_payload = struct.pack("<II", start_ts, end_ts)
             hist_frame = Command.SEND_HISTORICAL_DATA.build_frame(
                 seq=self._seq, payload=hist_payload, family=self._family
             )
-            await self._ble_client.write_gatt_char(char_uuid, hist_frame, response=True)
+            await self._ble_client.write_gatt_char(char_uuid, hist_frame, response=False)
+            print(f"  [history] waiting up to {timeout:.0f}s for type-47 historical frames...")
             logger.info(
-                "get_history: sent SEND_HISTORICAL_DATA (record indices 0→max, window=%ds)",
-                end_ts - start_ts,
+                "get_history: sent SEND_HISTORICAL_DATA start=%d end=%d (window=%ds)",
+                start_ts, end_ts, end_ts - start_ts,
             )
-            
-            # Wait a moment, then try Format B if no data arrived
-            await asyncio.sleep(2.0)
-            if frame_count[0] == 0:
-                self._seq = (self._seq + 1) & 0xFF
-                hist_payload = struct.pack("<II", start_ts, end_ts)
-                hist_frame = Command.SEND_HISTORICAL_DATA.build_frame(
-                    seq=self._seq, payload=hist_payload, family=self._family
-                )
-                await self._ble_client.write_gatt_char(char_uuid, hist_frame, response=True)
-                logger.info(
-                    "get_history: sent SEND_HISTORICAL_DATA (timestamps start=%d end=%d)",
-                    start_ts, end_ts,
-                )
 
             # Step 3: Wait for HISTORY_END/COMPLETE metadata frame.
             try:
                 await asyncio.wait_for(done_event.wait(), timeout=timeout)
             except asyncio.TimeoutError:
+                print(
+                    f"  [history] timed out after {timeout:.0f}s — "
+                    f"received {frame_count[0]} frames, {len(records)} records"
+                )
                 logger.warning(
                     "get_history timed out after %.0fs — "
                     "received %d frames, %d records",
@@ -851,13 +875,14 @@ class WhoopBleClient:
                 ack_frame = Command.HISTORICAL_DATA_RESULT.build_frame(
                     seq=self._seq, payload=ack_payload, family=self._family
                 )
-                await self._ble_client.write_gatt_char(char_uuid, ack_frame, response=True)
+                await self._ble_client.write_gatt_char(char_uuid, ack_frame, response=False)
                 logger.info("get_history: sent HISTORICAL_DATA_RESULT ACK")
 
             return records
 
         finally:
-            self._reassembler.on_frame = original_on_frame
+            if self._reassembler:
+                self._reassembler.on_frame = original_on_frame
 
     # ------------------------------------------------------------------
     # Internal
