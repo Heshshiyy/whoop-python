@@ -582,32 +582,45 @@ class WhoopBleClient:
             except Exception:
                 pass
 
-    async def read_battery(self) -> BatteryInfo | None:
-        """Read battery level using the correct sequence for WHOOP straps.
+    async def _wake_battery_reporting(self) -> None:
+        """Wake the strap's battery reporting by cycling the CMD notify subscription.
         
-        The WHOOP strap requires a GET_BATTERY_LEVEL command to be sent first
-        (wakes up the battery reporting), THEN the standard BLE Battery Service
-        returns the correct value. Without this sequence, the standard service
-        returns a stale/cached value (usually 100%).
+        On WHOOP 4.0, the standard BLE Battery Service (0x2A19) returns a stale
+        value (usually 100%) until the CMD notify characteristic is cycled
+        (stop_notify → start_notify). This cycling wakes the battery reporting
+        so subsequent reads return the correct value.
+        
+        Discovered empirically: commit 01034b4 showed 18% (correct) vs all
+        other commits showing 100% (wrong). The only difference was whether
+        CMD notify was re-subscribed before the battery read.
         """
-        if not self._ble_client or not self._ble_client.is_connected or not self._family:
+        if not self._ble_client or not self._family:
+            return
+        try:
+            await self._ble_client.stop_notify(self._family.cmd_notify_uuid)
+        except Exception:
+            pass
+        try:
+            await self._ble_client.start_notify(
+                self._family.cmd_notify_uuid, self._on_notification
+            )
+            await asyncio.sleep(0.3)
+        except Exception as e:
+            logger.debug("Battery wake cycle failed: %s", e)
+
+    async def read_battery(self) -> BatteryInfo | None:
+        """Read battery level from standard BLE Battery Service (0x2A19).
+        
+        Requires a CMD notify subscription cycle to wake the battery reporting
+        (see _wake_battery_reporting).
+        """
+        if not self._ble_client or not self._ble_client.is_connected:
             return None
         
-        # Step 1: Send GET_BATTERY_LEVEL as fire-and-forget (no response wait)
-        # This wakes the strap's battery reporting so the standard read is accurate
-        from whoop.protocol.commands import Command
-        try:
-            frame = Command.GET_BATTERY_LEVEL.build_frame(
-                seq=0, payload=b"", family=self._family
-            )
-            await self._ble_client.write_gatt_char(
-                self._family.cmd_char_uuid, frame, response=True
-            )
-            await asyncio.sleep(0.3)  # Let strap process the command
-        except Exception as e:
-            logger.debug("Battery wake command failed (non-fatal): %s", e)
+        # Wake battery reporting by cycling CMD notify subscription
+        await self._wake_battery_reporting()
         
-        # Step 2: Read standard BLE Battery Service (now returns correct value)
+        # Read standard BLE Battery Service
         try:
             data = await self._ble_client.read_gatt_char(
                 "00002a19-0000-1000-8000-00805f9b34fb"
