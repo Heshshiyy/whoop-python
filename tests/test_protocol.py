@@ -463,11 +463,12 @@ class TestFrameReassembler:
 class TestParseFrame:
     def test_parse_realtime(self):
         """Parse a type-40 realtime data frame."""
-        # Inner record: [type][seq][cmd][3 unknown][timestamp u32][sub u16][HR][rr_count][rr...]
-        inner = struct.pack("<BBB", 40, 0, 0)
-        inner += b"\x00\x00\x00"  # 3 unknown bytes
+        # Inner record layout (WHOOP 4): 
+        # [0] type=40, [1] sub=2, [2:6] ts u32 LE, [6:8] sub-s u16 LE,
+        # [8] hr u8, [9] rr_count, [10:] rr intervals u16 LE
+        inner = struct.pack("<BB", 40, 2)  # type, sub
         inner += struct.pack("<I", 1234567890)  # timestamp
-        inner += struct.pack("<H", 0)  # subseconds
+        inner += struct.pack("<H", 722)  # subseconds
         inner += struct.pack("<B", 72)  # HR
         inner += struct.pack("<B", 2)  # RR count
         inner += struct.pack("<HH", 800, 820)  # two RR intervals
