@@ -366,21 +366,23 @@ class WhoopBleClient:
         # Queue to capture the response — raw bytes from CMD notify
         response_future: asyncio.Future[bytes] = asyncio.get_event_loop().create_future()
         raw_chunks: list[bytes] = []
+        capture_ready: bool = False  # Set True after command write, skip stale
         
         def _capture_response(_sender: int, data: bytearray) -> None:
             raw = bytes(data)
             logger.debug("CMD notify raw: %d bytes: %s", len(raw), raw.hex()[:80])
+            if not capture_ready:
+                logger.debug("Discarding stale notification (pre-command)")
+                return
             raw_chunks.append(raw)
             if not response_future.done():
-                # Feed to reassembler first, then wait briefly for it to produce inner frame
                 accumulated = b"".join(raw_chunks)
                 if self._reassembler:
                     self._reassembler.feed(accumulated)
-                # Give reassembler a moment to produce frame (handled in _on_frame_capture)
-                # If no frame within 200ms, return raw bytes
-                asyncio.get_event_loop().call_later(0.2, 
-                    lambda: response_future.done() or response_future.set_result(accumulated)
-                )
+                def _set_result():
+                    if not response_future.done():
+                        response_future.set_result(accumulated)
+                asyncio.get_event_loop().call_later(0.2, _set_result)
             else:
                 if self._reassembler:
                     self._reassembler.feed(bytes(data))
@@ -404,7 +406,12 @@ class WhoopBleClient:
             await self._ble_client.start_notify(notify_uuid, _capture_response)
             await asyncio.sleep(0.5)
             logger.debug("Re-subscribed CMD notify for command capture")
-
+            
+            # Flush stale notifications (residual data from bonding)
+            await asyncio.sleep(0.2)
+            capture_ready = True
+            logger.debug("Now capturing fresh command response")
+            
             # Write command
             try:
                 await self._ble_client.write_gatt_char(char_uuid, frame, response=True)
@@ -413,7 +420,7 @@ class WhoopBleClient:
                 logger.debug("Write with response failed (%s), trying without...", e)
                 await self._ble_client.write_gatt_char(char_uuid, frame, response=False)
 
-            # Wait for response
+            # Wait for fresh response
             result = await asyncio.wait_for(response_future, timeout=10.0)
             logger.debug("Command response captured: %d bytes", len(result))
             return result
