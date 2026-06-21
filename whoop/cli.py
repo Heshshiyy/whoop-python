@@ -115,34 +115,12 @@ async def _cmd_info(args: argparse.Namespace) -> int:
             _print_kv("Family", family.value)
             _print_kv("Address", address)
             _print_kv("State", client.state.value)
-
-            # Try GET_HELLO_HARVARD (cmd 35) — returns serial, clock, charging
-            from whoop.protocol.commands import Command
-            from whoop.protocol.parse_frame import parse_frame
-            from whoop.protocol.packet_types import PacketTypes
             
-            hello_frame = Command.GET_HELLO_HARVARD.build_frame(seq=0, payload=b"", family=client._family)
-            resp = await client.send_command(hello_frame)
-            if resp is not None:
-                parsed = parse_frame(resp, client._family)
-                if isinstance(parsed, object) and hasattr(parsed, 'serial'):
-                    _print_kv("Serial", parsed.serial or "unknown")
-                if hasattr(parsed, 'clock'):
-                    _print_kv("Clock", str(parsed.clock) if parsed.clock else "unknown")
-                _print_kv("Response", f"{len(resp)} bytes received")
-            else:
-                _print_kv("Hello", "No response — trying GET_ADVERTISING_NAME")
-                adv_frame = Command.GET_ADVERTISING_NAME_HARVARD.build_frame(seq=0, payload=b"", family=client._family)
-                resp2 = await client.send_command(adv_frame)
-                if resp2 is not None:
-                    _print_kv("Response", f"{len(resp2)} bytes received")
-                    _print_kv("Raw", resp2.hex())
-                else:
-                    _print_kv("Response", "No response")
-
             battery = await client.read_battery()
             if battery:
                 _print_kv("Battery", f"{battery.level}% {'(charging)' if battery.is_charging else ''}")
+            else:
+                _print_kv("Battery", "Could not read")
 
             await client.disconnect()
             return 0

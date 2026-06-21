@@ -585,12 +585,14 @@ class WhoopBleClient:
     async def read_battery(self) -> BatteryInfo | None:
         """Read battery level from standard BLE Battery Service (0x2A19).
         
-        The WHOOP strap exposes battery level through the standard BLE Battery
-        Service characteristic. This returns the correct value (confirmed: 18%
-        when the WHOOP app shows 19%). The WHOOP command GET_BATTERY_LEVEL is
-        unreliable due to stale notification capture issues.
+        This is the authoritative battery source — the WHOOP strap reports
+        its battery level through this standard BLE characteristic. The
+        value is a uint8 representing percentage (0-100).
+        
+        The WHOOP command GET_BATTERY_LEVEL (cmd 26) is not used because
+        the strap doesn't respond to it, and the CMD notify manipulation
+        interferes with the standard BLE read.
         """
-        # Primary: standard BLE Battery Service (verified correct)
         if self._ble_client and self._ble_client.is_connected:
             try:
                 data = await self._ble_client.read_gatt_char(
@@ -601,23 +603,6 @@ class WhoopBleClient:
                     return BatteryInfo(level=level, is_charging=False)
             except Exception as e:
                 logger.debug("Standard battery read failed: %s", e)
-        
-        # Fallback: WHOOP command (may return stale data)
-        from whoop.protocol.commands import Command
-        resp = await self.send_command(
-            Command.GET_BATTERY_LEVEL.build_frame(seq=0, payload=b"", family=self._family)
-        )
-        if resp is not None and len(resp) >= 6:
-            try:
-                payload = resp[3:]
-                level = payload[0]
-                if len(payload) >= 2:
-                    level = (payload[1] << 8) | payload[0]
-                charging = payload[2] > 0 if len(payload) > 2 else False
-                return BatteryInfo(level=level, is_charging=charging)
-            except Exception as e:
-                logger.debug("Battery parse error: %s", e)
-        
         return None
 
     # ------------------------------------------------------------------
