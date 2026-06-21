@@ -229,88 +229,81 @@ class WhoopBleClient:
             return False
 
     async def _trigger_bond(self) -> None:
-        """Trigger just-works bonding by writing SET_CLOCK to the CMD characteristic.
+        """Subscribe to all notify channels and open the WHOOP CMD channel.
 
-        WHOOP 4.0 requires bonding before it will respond to commands. The bond flow:
-        1. Write to CMD char → strap rejects with "Insufficient Authentication"
-        2. Windows BLE stack triggers just-works pairing (no PIN)
-        3. Connection drops during pairing
-        4. Reconnect (now bonded)
-        5. Re-subscribe to notifications
+        The correct first command per handshake.py is GET_HELLO_HARVARD (35).
+        Sending anything else first (e.g. SET_CLOCK) causes the strap to silently
+        ignore all subsequent commands. If the strap rejects with
+        Insufficient Authentication, Windows triggers just-works pairing, we
+        reconnect, then re-send.
 
-        We deliberately use SET_CLOCK (not GET_BATTERY_LEVEL) here so that
-        read_battery() can send GET_BATTERY_LEVEL fresh and get the strap's first
-        response for that command — the strap ignores a second GET_BATTERY_LEVEL
-        in the same connection.
+        Per-channel callbacks log every raw notification byte so we can see the
+        strap's hello response.
         """
         from whoop.protocol.commands import Command
         if self._ble_client is None or self._family is None:
             return
-        
-        notify_uuid = self._family.cmd_notify_uuid
+
         char_uuid = self._family.cmd_char_uuid
         address = self._device.address if self._device else ""
-        
-        # Step 1: Subscribe to ALL proprietary notify characteristics.
-        # 61080007 is present on WHOOP 4 straps as an aux notify channel —
-        # subscribe to it too in case responses land there.
-        _aux_uuids = [
-            notify_uuid,
-            self._family.event_notify_uuid,
-            self._family.data_notify_uuid,
-        ]
-        # 61080007 (aux) — present on WHOOP 4 even though family.aux_notify_uuid=None
+
         _whoop4_aux = "61080007-8d6d-82b8-614a-1c8cb0f8dcc6"
-        if self._family.aux_notify_uuid:
-            _aux_uuids.append(self._family.aux_notify_uuid)
-        elif self._family.is_whoop4:
-            _aux_uuids.append(_whoop4_aux)
+        _channel_uuids: list[tuple[str, str]] = [
+            (self._family.cmd_notify_uuid,   "CMD "),
+            (self._family.event_notify_uuid, "EVT "),
+            (self._family.data_notify_uuid,  "DATA"),
+            (self._family.aux_notify_uuid or _whoop4_aux, "AUX "),
+        ]
 
-        subscribed_any = False
-        for _uuid in _aux_uuids:
-            try:
-                await self._ble_client.start_notify(_uuid, self._on_notification)
-                subscribed_any = True
-                logger.debug("Subscribed to %s", _uuid)
-            except Exception as e:
-                logger.debug("Could not subscribe to %s: %s", _uuid, e)
+        def _make_channel_cb(tag: str):
+            """Per-channel callback: logs raw bytes then feeds the reassembler."""
+            def _cb(_sender: int, data: bytearray) -> None:
+                logger.info("NOTIFY [%s] %d bytes: %s", tag, len(data), bytes(data).hex())
+                self._on_notification(_sender, data)
+            return _cb
 
-        if not subscribed_any:
+        async def _subscribe_all() -> bool:
+            subscribed = 0
+            for _uuid, _tag in _channel_uuids:
+                try:
+                    await self._ble_client.start_notify(_uuid, _make_channel_cb(_tag))  # type: ignore[union-attr]
+                    subscribed += 1
+                    logger.debug("Subscribed to %s (%s)", _tag.strip(), _uuid)
+                except Exception as e:
+                    logger.debug("Could not subscribe to %s: %s", _uuid, e)
+            return subscribed > 0
+
+        if not await _subscribe_all():
             logger.warning("Could not subscribe to any notify characteristic")
             return
 
-        await asyncio.sleep(0.3)
+        # Wait for CCCD writes to settle before sending the first command.
+        await asyncio.sleep(0.5)
 
-        import time as _time
-        _now = int(_time.time())
-        _clock_payload = _now.to_bytes(4, "little") + b"\x00\x00\x00\x00"
-        frame = Command.SET_CLOCK.build_frame(seq=0, payload=_clock_payload, family=self._family)
+        # GET_HELLO_HARVARD is the mandated first command — it must arrive before
+        # any other write or the strap ignores all commands.
+        frame = Command.GET_HELLO_HARVARD.build_frame(seq=0, payload=b"", family=self._family)
 
         for attempt in range(3):
             try:
-                logger.debug("Bond attempt %d: writing to CMD char (write-without-response)...", attempt + 1)
-                # Use write-without-response (response=False) — the WHOOP command
-                # characteristic lists write-without-response FIRST in its properties,
-                # meaning the firmware's command handler is on that ATT path.
-                # response=True writes get BLE-layer ACKed but the app layer ignores them.
+                logger.debug("Bond attempt %d: writing GET_HELLO_HARVARD (write-without-response)...", attempt + 1)
                 await self._ble_client.write_gatt_char(char_uuid, frame, response=False)
                 self._bonded = True
-                logger.info("Bond established — command written (write-without-response)")
+                logger.info("Bond attempt %d: GET_HELLO_HARVARD written — watching for hello response...", attempt + 1)
+                # Give the strap up to 2 s to send its hello reply on CMD notify.
+                await asyncio.sleep(2.0)
                 return
             except Exception as e:
                 msg = str(e)
                 logger.debug("Bond attempt %d error: %s", attempt + 1, msg)
 
                 if "Insufficient Authentication" in msg or "Insufficient Encryption" in msg:
-                    logger.info("Bonding triggered — waiting for Windows pairing to complete...")
+                    logger.info("Bonding triggered — waiting for Windows pairing...")
                     await asyncio.sleep(5.0)
-
                     try:
                         await self._ble_client.disconnect()
                     except Exception:
                         pass
-
-                    logger.debug("Reconnecting after pairing...")
                     try:
                         self._ble_client = BleakClient(
                             address,
@@ -318,32 +311,21 @@ class WhoopBleClient:
                             timeout=15.0,
                         )
                         await self._ble_client.connect()
-                        logger.debug("Reconnected — re-subscribing notify channels")
-                        for _uuid in _aux_uuids:
-                            try:
-                                await self._ble_client.start_notify(_uuid, self._on_notification)
-                            except Exception:
-                                pass
-                        await asyncio.sleep(0.3)
-
-                        try:
-                            await self._ble_client.write_gatt_char(char_uuid, frame, response=False)
-                            self._bonded = True
-                            logger.info("Bond established after reconnect")
-                            return
-                        except Exception as e2:
-                            logger.debug("Write after reconnect failed: %s", e2)
+                        await _subscribe_all()
+                        await asyncio.sleep(0.5)
+                        await self._ble_client.write_gatt_char(char_uuid, frame, response=False)
+                        self._bonded = True
+                        logger.info("Bond established after reconnect")
+                        await asyncio.sleep(2.0)
+                        return
                     except Exception as e3:
-                        logger.debug("Reconnect failed: %s", e3)
-
+                        logger.debug("Reconnect/write failed: %s", e3)
                     continue
 
                 elif "Protocol Error" in msg:
-                    logger.debug("Protocol error — retrying in 2s")
                     await asyncio.sleep(2.0)
                     continue
                 elif "disconnected" in msg.lower() or "not connected" in msg.lower():
-                    logger.info("Connection lost during bonding — reconnecting...")
                     await asyncio.sleep(3.0)
                     try:
                         self._ble_client = BleakClient(
@@ -352,20 +334,16 @@ class WhoopBleClient:
                             timeout=15.0,
                         )
                         await self._ble_client.connect()
-                        for _uuid in _aux_uuids:
-                            try:
-                                await self._ble_client.start_notify(_uuid, self._on_notification)
-                            except Exception:
-                                pass
-                        await asyncio.sleep(0.3)
+                        await _subscribe_all()
+                        await asyncio.sleep(0.5)
                         continue
                     except Exception:
                         break
                 else:
-                    logger.warning("Unexpected bonding error: %s", e)
+                    logger.warning("Unexpected bond error: %s", e)
                     break
 
-        logger.warning("Bonding did not complete after 3 attempts")
+        logger.warning("Bond sequence did not complete after 3 attempts")
 
     async def disconnect(self) -> None:
         """Disconnect from the strap gracefully."""
@@ -430,7 +408,7 @@ class WhoopBleClient:
                 logger.debug("Write without response failed (%s), retrying with response...", e)
                 await self._ble_client.write_gatt_char(char_uuid, frame, response=True)
 
-            result = await asyncio.wait_for(response_future, timeout=5.0)
+            result = await asyncio.wait_for(response_future, timeout=2.0)
             logger.debug("Command response captured: %d bytes", len(result))
             return result
         except asyncio.TimeoutError:
@@ -494,34 +472,56 @@ class WhoopBleClient:
             return False
         logger.info("WHOOP proprietary notifications enabled (%d channels)", subscribed)
         
-        # Step 3: Run WHOOP 4.0 handshake sequence
+        # Step 3: Full WHOOP 4.0 handshake — correct order per handshake.py.
+        # GET_HELLO_HARVARD was already sent in _trigger_bond(); the strap needs
+        # the remaining sequence to open the data stream.
         import time as _time
+        from whoop.protocol.handshake import build_clock_payload
         now = int(_time.time())
-        
-        # SET_CLOCK (cmd 10) — sync phone time to strap (required before data flows)
-        clock_payload = now.to_bytes(4, "little") + b"\x00\x00\x00\x00"
-        resp = await self.send_command(
-            Command.SET_CLOCK.build_frame(seq=1, payload=clock_payload, family=self._family)
-        )
-        if resp:
-            logger.info("Clock synced")
-        else:
-            logger.debug("SET_CLOCK no response (non-fatal)")
-        
-        # STOP raw type-43 flood (cmd 63 with 0x00)
-        resp = await self.send_command(
-            Command.SEND_R10_R11_REALTIME.build_frame(seq=2, payload=b"\x00", family=self._family)
-        )
-        if resp:
-            logger.info("Raw data flood stopped")
-        
-        # Start realtime HR streaming (cmd 3 with 0x01)
-        resp = await self.send_command(
-            Command.TOGGLE_REALTIME_HR.build_frame(seq=3, payload=b"\x01", family=self._family)
-        )
-        if resp:
-            logger.info("Realtime HR streaming started")
-        
+
+        async def _cmd(seq: int, frame: bytes, desc: str) -> bytes | None:
+            resp = await self.send_command(frame)
+            if resp:
+                logger.info("Handshake ack: %s (%d bytes) %s", desc, len(resp), resp.hex())
+            else:
+                logger.debug("Handshake no-response: %s (non-fatal)", desc)
+            return resp
+
+        seq = 1
+        # GET_ADVERTISING_NAME_HARVARD — ask strap for its BLE name
+        await _cmd(seq, Command.GET_ADVERTISING_NAME_HARVARD.build_frame(
+            seq=seq, payload=b"", family=self._family), "GET_ADV_NAME")
+        seq += 1
+
+        # SET_CLOCK — sync time
+        await _cmd(seq, Command.SET_CLOCK.build_frame(
+            seq=seq, payload=build_clock_payload(now), family=self._family), "SET_CLOCK")
+        seq += 1
+
+        # GET_CLOCK — confirm time sync
+        await _cmd(seq, Command.GET_CLOCK.build_frame(
+            seq=seq, payload=b"", family=self._family), "GET_CLOCK")
+        seq += 1
+
+        # STOP raw type-43 sensor flood (0x00 = stop)
+        await _cmd(seq, Command.SEND_R10_R11_REALTIME.build_frame(
+            seq=seq, payload=b"\x00", family=self._family), "STOP_RAW")
+        seq += 1
+
+        # GET_DATA_RANGE — ask strap what historical data it has stored
+        resp = await _cmd(seq, Command.GET_DATA_RANGE.build_frame(
+            seq=seq, payload=b"", family=self._family), "GET_DATA_RANGE")
+        if resp and len(resp) >= 11:
+            import struct
+            range_start = struct.unpack_from("<I", resp, 3)[0]
+            range_end   = struct.unpack_from("<I", resp, 7)[0]
+            logger.info("Strap data range: %d → %d (%d s)", range_start, range_end, range_end - range_start)
+        seq += 1
+
+        # TOGGLE_REALTIME_HR — start live HR stream (0x01 = start)
+        await _cmd(seq, Command.TOGGLE_REALTIME_HR.build_frame(
+            seq=seq, payload=b"\x01", family=self._family), "TOGGLE_REALTIME_HR")
+
         return True
 
     def _on_std_hr(self, _sender: int, data: bytearray) -> None:
@@ -675,6 +675,158 @@ class WhoopBleClient:
             logger.debug("Battery 0x2A19 read failed: %s", e)
 
         return None
+
+    # ------------------------------------------------------------------
+    # Historical data offload
+    # ------------------------------------------------------------------
+
+    async def get_history(
+        self,
+        start_ts: int,
+        end_ts: int | None = None,
+        timeout: float = 60.0,
+    ) -> list:
+        """Offload historical records stored on the strap for a time window.
+
+        Performs a minimal handshake (STOP_RAW to confirm the CMD channel is
+        alive), then sends SEND_HISTORICAL_DATA and collects type-47 frames via
+        the FrameReassembler until the strap sends a METADATA HISTORY_END/COMPLETE
+        frame, then ACKs with HISTORICAL_DATA_RESULT.
+
+        Returns a list of HistoricalRecord dataclass instances.
+        NOTE: requires the CMD channel to be open — i.e. connect() must have
+        been called (which sends GET_HELLO_HARVARD in _trigger_bond).
+        """
+        import struct
+        import time as _time
+        from whoop.protocol.commands import Command
+        from whoop.protocol.parse_frame import parse_frame
+        from whoop.protocol.parsed_frame import (
+            CommandResponse, HistoricalDataFrame, Metadata, MetadataKind,
+        )
+        from whoop.protocol.handshake import build_ack_payload
+
+        if not self._ble_client or not self._ble_client.is_connected:
+            logger.error("get_history: not connected")
+            return []
+        if not self._family or not self._reassembler:
+            return []
+
+        if end_ts is None:
+            end_ts = int(_time.time())
+
+        char_uuid = self._family.cmd_char_uuid
+
+        # Ensure all proprietary channels are subscribed so we receive
+        # type-47 historical data frames on whichever UUID the strap uses.
+        _notify_uuids = [
+            self._family.cmd_notify_uuid,
+            self._family.event_notify_uuid,
+            self._family.data_notify_uuid,
+            "61080007-8d6d-82b8-614a-1c8cb0f8dcc6",
+        ]
+        for _uuid in _notify_uuids:
+            try:
+                await self._ble_client.start_notify(_uuid, self._on_notification)
+            except Exception:
+                pass
+
+        records: list = []
+        done_event: asyncio.Event = asyncio.Event()
+        frame_count: list[int] = [0]  # mutable counter for inner closure
+
+        # Swap the reassembler callback so we collect every frame directly.
+        original_on_frame = self._reassembler.on_frame
+
+        def _collect(inner: bytes) -> None:
+            frame_count[0] += 1
+            logger.info(
+                "get_history frame #%d: %d bytes %s",
+                frame_count[0], len(inner), inner[:8].hex(),
+            )
+            parsed = parse_frame(inner, self._family)  # type: ignore[arg-type]
+            if parsed is None:
+                logger.debug("get_history: parse_frame returned None for inner %s", inner[:8].hex())
+                return
+            logger.debug("get_history parsed: %s", type(parsed).__name__)
+            if isinstance(parsed, HistoricalDataFrame):
+                batch = parsed.records
+                records.extend(batch)
+                logger.info(
+                    "Historical record batch: %d records (total %d)",
+                    len(batch), len(records),
+                )
+            elif isinstance(parsed, Metadata):
+                logger.info("Metadata: %s", parsed.metadata_kind)
+                if parsed.metadata_kind in (
+                    MetadataKind.HISTORY_END,
+                    MetadataKind.HISTORY_COMPLETE,
+                ):
+                    logger.info("History transfer complete — %d records", len(records))
+                    done_event.set()
+            elif isinstance(parsed, CommandResponse):
+                logger.info(
+                    "CMD response during history: cmd=%d code=%d payload=%s",
+                    parsed.cmd, parsed.response_code, parsed.response_payload.hex(),
+                )
+            # Also forward to the normal handler so on_data still fires.
+            if original_on_frame is not None:
+                original_on_frame(inner)
+
+        self._reassembler.on_frame = _collect
+
+        try:
+            # Step 1: STOP_RAW — confirms CMD channel is active and stops any
+            # ongoing type-43 raw sensor flood before requesting history.
+            # The strap responds to this (cmd=63, payload=b"\x00") with a
+            # type-36 CommandResponse, which _collect will log and ignore.
+            self._seq = (self._seq + 1) & 0xFF
+            stop_frame = Command.SEND_R10_R11_REALTIME.build_frame(
+                seq=self._seq, payload=b"\x00", family=self._family
+            )
+            await self._ble_client.write_gatt_char(char_uuid, stop_frame, response=False)
+            logger.info("get_history: sent STOP_RAW — waiting 2s for CMD channel confirmation")
+            await asyncio.sleep(2.0)
+
+            # Step 2: SEND_HISTORICAL_DATA — request the time window.
+            #   Payload format: start_ts (u32 LE) + end_ts (u32 LE) = 8 bytes.
+            #   The strap responds with a stream of type-47 HistoricalDataFrame
+            #   notifications followed by a type-49 Metadata(HISTORY_END) frame.
+            self._seq = (self._seq + 1) & 0xFF
+            hist_payload = struct.pack("<II", start_ts, end_ts)
+            hist_frame = Command.SEND_HISTORICAL_DATA.build_frame(
+                seq=self._seq, payload=hist_payload, family=self._family
+            )
+            await self._ble_client.write_gatt_char(char_uuid, hist_frame, response=False)
+            logger.info(
+                "get_history: sent SEND_HISTORICAL_DATA start=%d end=%d (window=%ds)",
+                start_ts, end_ts, end_ts - start_ts,
+            )
+
+            # Step 3: Wait for HISTORY_END/COMPLETE metadata frame.
+            try:
+                await asyncio.wait_for(done_event.wait(), timeout=timeout)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "get_history timed out after %.0fs — "
+                    "received %d frames, %d records",
+                    timeout, frame_count[0], len(records),
+                )
+
+            # Step 4: ACK — tell strap we received data up to end_ts.
+            if records:
+                ack_payload = build_ack_payload(end_ts)
+                self._seq = (self._seq + 1) & 0xFF
+                ack_frame = Command.HISTORICAL_DATA_RESULT.build_frame(
+                    seq=self._seq, payload=ack_payload, family=self._family
+                )
+                await self._ble_client.write_gatt_char(char_uuid, ack_frame, response=False)
+                logger.info("get_history: sent HISTORICAL_DATA_RESULT ACK")
+
+            return records
+
+        finally:
+            self._reassembler.on_frame = original_on_frame
 
     # ------------------------------------------------------------------
     # Internal

@@ -292,6 +292,123 @@ async def _cmd_export(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _cmd_history(args: argparse.Namespace) -> int:
+    """Offload last N minutes of HR data from the strap, save to DB, and display."""
+    address = args.address
+    minutes = args.minutes
+    db_path = args.database or os.path.expanduser("~/.whoop/whoop.db")
+
+    end_ts = int(time.time())
+    start_ts = end_ts - minutes * 60
+
+    _print_header(f"Fetching last {minutes} min of HR from {address}...")
+
+    db = WhoopDatabase(db_path)
+    client = WhoopBleClient()
+
+    ok = await client.connect(address, DeviceFamilyKind.WHOOP_4, timeout=15.0)
+    if not ok:
+        _print_kv("Error", "Could not connect")
+        db.close()
+        return 1
+
+    device_id = db.ensure_device(address, family="Whoop4")
+
+    # Try historical offload from strap memory
+    _print_kv("Status", f"Requesting historical data from strap (60s timeout, window={minutes}min)...")
+    _print_kv("Time range", f"{start_ts} → {end_ts}")
+    records = await client.get_history(start_ts, end_ts, timeout=60.0)
+
+    if records:
+        hr_samples = [
+            (r.unix, r.heart_rate) for r in records
+            if r.unix >= start_ts and r.heart_rate > 0
+        ]
+        rr_samples = [
+            (r.unix, float(rr)) for r in records for rr in r.rr_intervals
+        ]
+        saved_hr = db.insert_hr_samples(device_id, hr_samples)
+        saved_rr = db.insert_rr_intervals(device_id, rr_samples)
+        _print_kv("Records from strap", str(len(records)))
+        _print_kv("HR samples saved", str(saved_hr))
+        _print_kv("RR intervals saved", str(saved_rr))
+    else:
+        _print_kv(
+            "Note",
+            "Strap returned no historical data — showing what is already in DB. "
+            "Run `whoop record` to build up a local history.",
+        )
+
+    await client.disconnect()
+
+    # Show from DB (includes freshly offloaded data)
+    rows = db.get_hr_range(device_id, start_ts, end_ts)
+    db.close()
+
+    if not rows:
+        _print_kv(
+            "No data",
+            f"Nothing recorded in last {minutes} min. "
+            f"Run: whoop record {address} --duration {minutes * 60}",
+        )
+        return 0
+
+    _print_header(f"Heart rate — last {minutes} minutes  ({len(rows)} samples)")
+    table_rows = [
+        [datetime.datetime.fromtimestamp(ts).strftime("%H:%M:%S"), f"{hr} bpm"]
+        for ts, hr in rows[-50:]
+    ]
+    _print_table(["Time", "Heart Rate"], table_rows)
+
+    hrs = [hr for _, hr in rows]
+    _print_kv("Average", f"{sum(hrs) // len(hrs)} bpm")
+    _print_kv("Min / Max", f"{min(hrs)} / {max(hrs)} bpm")
+    return 0
+
+
+async def _cmd_show(args: argparse.Namespace) -> int:
+    """Query local DB for last N minutes of HR — no BLE needed."""
+    db_path = args.database or os.path.expanduser("~/.whoop/whoop.db")
+    minutes = args.minutes
+    end_ts = int(time.time())
+    start_ts = end_ts - minutes * 60
+
+    db = WhoopDatabase(db_path)
+    devices = db._conn.execute("SELECT id, address FROM device").fetchall()
+
+    if not devices:
+        _print_kv("No data", "No devices in DB. Run `whoop record <address>` first.")
+        db.close()
+        return 0
+
+    for dev_id, addr in devices:
+        rows = db.get_hr_range(dev_id, start_ts, end_ts)
+        if not rows:
+            _print_kv(addr, f"No HR data in last {minutes} min")
+            continue
+
+        _print_header(f"{addr} — last {minutes} minutes  ({len(rows)} samples)")
+        table_rows = [
+            [datetime.datetime.fromtimestamp(ts).strftime("%H:%M:%S"), f"{hr} bpm"]
+            for ts, hr in rows[-50:]
+        ]
+        _print_table(["Time", "Heart Rate"], table_rows)
+
+        hrs = [hr for _, hr in rows]
+        _print_kv("Average", f"{sum(hrs) // len(hrs)} bpm")
+        _print_kv("Min / Max", f"{min(hrs)} / {max(hrs)} bpm")
+
+        rr_rows = db.get_rr_range(dev_id, start_ts, end_ts)
+        if rr_rows:
+            from whoop.analytics import compute_rmssd
+            rmssd = compute_rmssd([rr for _, rr in rr_rows])
+            if rmssd:
+                _print_kv("HRV (RMSSD)", f"{rmssd:.1f} ms")
+
+    db.close()
+    return 0
+
+
 async def _cmd_battery(args: argparse.Namespace) -> int:
     """Read battery level from a connected strap."""
     address = args.address
@@ -350,6 +467,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_exp.add_argument("path", help="Output CSV path")
     p_exp.add_argument("--database", help="SQLite database path")
 
+    # history — offload from strap + show
+    p_hist = sub.add_parser("history", help="Pull last N min of HR from strap and show")
+    p_hist.add_argument("address", help="BLE address")
+    p_hist.add_argument("--minutes", type=int, default=10, help="How many minutes back (default 10)")
+    p_hist.add_argument("--database", help="SQLite database path")
+
+    # show — query local DB only (no BLE)
+    p_show = sub.add_parser("show", help="Show last N min of HR from local database")
+    p_show.add_argument("--minutes", type=int, default=10, help="How many minutes back (default 10)")
+    p_show.add_argument("--database", help="SQLite database path")
+
     # battery
     p_bat = sub.add_parser("battery", help="Read battery level")
     p_bat.add_argument("address", help="BLE address")
@@ -374,6 +502,8 @@ def main() -> None:
         "record": _cmd_record,
         "dashboard": _cmd_dashboard,
         "export": _cmd_export,
+        "history": _cmd_history,
+        "show": _cmd_show,
         "battery": _cmd_battery,
     }
 

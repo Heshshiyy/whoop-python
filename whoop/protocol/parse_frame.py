@@ -238,15 +238,25 @@ def _parse_v18_record(inner: bytes) -> HistoricalRecord:
 
 
 def _parse_realtime(inner: bytes, family: DeviceFamily, seq: int) -> RealtimeData:
-    """Parse type-40 realtime data frame."""
-    ts = _read_u32le(inner, 6)
-    sub = _read_u16le(inner, 10)
-    hr = (inner[12] if len(inner) > 12 else 0) & 0xFF
-    rr_count = (inner[13] if len(inner) > 13 else 0) & 0xFF
+    """Parse type-40 realtime data frame.
+
+    WHOOP 4 type-40 inner record layout (20 bytes observed):
+      [0]    type  = 0x28 = 40
+      [1]    sub   = 0x02 (constant sub-type / version)
+      [2:6]  ts    unix timestamp u32 LE  (LSB occupies the "cmd" slot at [2])
+      [6:8]  sub-s sub-second counter u16 LE
+      [8]    hr    heart rate uint8 bpm
+      [9]    rr_n  number of RR intervals that follow
+      [10:]  rr    rr_n × u16 LE values in milliseconds
+    """
+    ts = _read_u32le(inner, 2)   # was 6 — timestamp LSB sits in the "cmd" byte slot
+    sub = _read_u16le(inner, 6)  # was 10
+    hr = (inner[8] if len(inner) > 8 else 0) & 0xFF     # was 12
+    rr_count = (inner[9] if len(inner) > 9 else 0) & 0xFF   # was 13
     rr: list[int] = []
-    if rr_count > 0 and len(inner) >= 14 + rr_count * 2:
+    if rr_count > 0 and len(inner) >= 10 + rr_count * 2:    # was 14
         for i in range(rr_count):
-            rr.append(_read_u16le(inner, 14 + i * 2))
+            rr.append(_read_u16le(inner, 10 + i * 2))        # was 14
     return RealtimeData(
         family=family, seq=seq, timestamp=ts, subseconds=sub,
         heart_rate=hr, rr_count=rr_count, rr_intervals=rr,
