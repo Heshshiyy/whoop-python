@@ -583,19 +583,23 @@ class WhoopBleClient:
                 pass
 
     async def _wake_battery_reporting(self) -> None:
-        """Wake the strap's battery reporting by cycling the CMD notify subscription.
+        """Wake the strap's battery reporting by cycling CMD notify + writing a command.
         
         On WHOOP 4.0, the standard BLE Battery Service (0x2A19) returns a stale
-        value (usually 100%) until the CMD notify characteristic is cycled
-        (stop_notify → start_notify). This cycling wakes the battery reporting
-        so subsequent reads return the correct value.
+        value (usually 100%) until:
+        1. The CMD notify subscription is cycled (stop → start)
+        2. A command is written to the CMD characteristic (write_gatt_char)
         
-        Discovered empirically: commit 01034b4 showed 18% (correct) vs all
-        other commits showing 100% (wrong). The only difference was whether
-        CMD notify was re-subscribed before the battery read.
+        Both steps are required. Discovered empirically: commit 01034b4 (which
+        did both) showed 18% correct; all other commits (missing one step)
+        showed 100% stale.
         """
         if not self._ble_client or not self._family:
             return
+        
+        from whoop.protocol.commands import Command
+        
+        # Step 1: Cycle CMD notify subscription
         try:
             await self._ble_client.stop_notify(self._family.cmd_notify_uuid)
         except Exception:
@@ -606,7 +610,21 @@ class WhoopBleClient:
             )
             await asyncio.sleep(0.3)
         except Exception as e:
-            logger.debug("Battery wake cycle failed: %s", e)
+            logger.debug("Battery notify cycle failed: %s", e)
+            return
+        
+        # Step 2: Write a command to wake battery reporting
+        # GET_BATTERY_LEVEL triggers the strap to update its battery value
+        try:
+            frame = Command.GET_BATTERY_LEVEL.build_frame(
+                seq=0, payload=b"", family=self._family
+            )
+            await self._ble_client.write_gatt_char(
+                self._family.cmd_char_uuid, frame, response=True
+            )
+            await asyncio.sleep(0.3)
+        except Exception as e:
+            logger.debug("Battery wake command failed (non-fatal): %s", e)
 
     async def read_battery(self) -> BatteryInfo | None:
         """Read battery level from standard BLE Battery Service (0x2A19).
