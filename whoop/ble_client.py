@@ -583,26 +583,42 @@ class WhoopBleClient:
                 pass
 
     async def read_battery(self) -> BatteryInfo | None:
-        """Read battery level from standard BLE Battery Service (0x2A19).
+        """Read battery level using the correct sequence for WHOOP straps.
         
-        This is the authoritative battery source — the WHOOP strap reports
-        its battery level through this standard BLE characteristic. The
-        value is a uint8 representing percentage (0-100).
-        
-        The WHOOP command GET_BATTERY_LEVEL (cmd 26) is not used because
-        the strap doesn't respond to it, and the CMD notify manipulation
-        interferes with the standard BLE read.
+        The WHOOP strap requires a GET_BATTERY_LEVEL command to be sent first
+        (wakes up the battery reporting), THEN the standard BLE Battery Service
+        returns the correct value. Without this sequence, the standard service
+        returns a stale/cached value (usually 100%).
         """
-        if self._ble_client and self._ble_client.is_connected:
-            try:
-                data = await self._ble_client.read_gatt_char(
-                    "00002a19-0000-1000-8000-00805f9b34fb"
-                )
-                if data and len(data) > 0:
-                    level = data[0]
-                    return BatteryInfo(level=level, is_charging=False)
-            except Exception as e:
-                logger.debug("Standard battery read failed: %s", e)
+        if not self._ble_client or not self._ble_client.is_connected or not self._family:
+            return None
+        
+        # Step 1: Send GET_BATTERY_LEVEL as fire-and-forget (no response wait)
+        # This wakes the strap's battery reporting so the standard read is accurate
+        from whoop.protocol.commands import Command
+        try:
+            frame = Command.GET_BATTERY_LEVEL.build_frame(
+                seq=0, payload=b"", family=self._family
+            )
+            await self._ble_client.write_gatt_char(
+                self._family.cmd_char_uuid, frame, response=True
+            )
+            await asyncio.sleep(0.3)  # Let strap process the command
+        except Exception as e:
+            logger.debug("Battery wake command failed (non-fatal): %s", e)
+        
+        # Step 2: Read standard BLE Battery Service (now returns correct value)
+        try:
+            data = await self._ble_client.read_gatt_char(
+                "00002a19-0000-1000-8000-00805f9b34fb"
+            )
+            if data and len(data) > 0:
+                level = data[0]
+                logger.debug("Battery: %d%%", level)
+                return BatteryInfo(level=level, is_charging=False)
+        except Exception as e:
+            logger.debug("Standard battery read failed: %s", e)
+        
         return None
 
     # ------------------------------------------------------------------
