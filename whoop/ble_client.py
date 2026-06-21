@@ -776,16 +776,27 @@ class WhoopBleClient:
         self._reassembler.on_frame = _collect
 
         try:
+            # Step 0: SET_CLOCK — strap requires time sync before historical offload
+            import time as _time
+            from whoop.protocol.handshake import build_clock_payload
+            self._seq = (self._seq + 1) & 0xFF
+            clock_frame = Command.SET_CLOCK.build_frame(
+                seq=self._seq, payload=build_clock_payload(), family=self._family
+            )
+            resp = await self.send_command(clock_frame)
+            logger.info("get_history: SET_CLOCK %s", "ack" if resp else "no response (non-fatal)")
+            
             # Step 1: STOP_RAW — confirms CMD channel is active and stops any
             # ongoing type-43 raw sensor flood before requesting history.
-            # The strap responds to this (cmd=63, payload=b"\x00") with a
-            # type-36 CommandResponse, which _collect will log and ignore.
             self._seq = (self._seq + 1) & 0xFF
             stop_frame = Command.SEND_R10_R11_REALTIME.build_frame(
                 seq=self._seq, payload=b"\x00", family=self._family
             )
-            await self._ble_client.write_gatt_char(char_uuid, stop_frame, response=False)
-            logger.info("get_history: sent STOP_RAW — waiting 2s for CMD channel confirmation")
+            resp = await self.send_command(stop_frame)
+            if resp:
+                logger.info("get_history: STOP_RAW acknowledged")
+            else:
+                logger.info("get_history: sent STOP_RAW (no ack) — waiting 2s")
             await asyncio.sleep(2.0)
 
             # Step 2: SEND_HISTORICAL_DATA — request the time window.
@@ -797,7 +808,7 @@ class WhoopBleClient:
             hist_frame = Command.SEND_HISTORICAL_DATA.build_frame(
                 seq=self._seq, payload=hist_payload, family=self._family
             )
-            await self._ble_client.write_gatt_char(char_uuid, hist_frame, response=False)
+            await self._ble_client.write_gatt_char(char_uuid, hist_frame, response=True)
             logger.info(
                 "get_history: sent SEND_HISTORICAL_DATA start=%d end=%d (window=%ds)",
                 start_ts, end_ts, end_ts - start_ts,
@@ -820,7 +831,7 @@ class WhoopBleClient:
                 ack_frame = Command.HISTORICAL_DATA_RESULT.build_frame(
                     seq=self._seq, payload=ack_payload, family=self._family
                 )
-                await self._ble_client.write_gatt_char(char_uuid, ack_frame, response=False)
+                await self._ble_client.write_gatt_char(char_uuid, ack_frame, response=True)
                 logger.info("get_history: sent HISTORICAL_DATA_RESULT ACK")
 
             return records
