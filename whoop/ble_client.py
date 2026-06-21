@@ -583,43 +583,41 @@ class WhoopBleClient:
                 pass
 
     async def read_battery(self) -> BatteryInfo | None:
-        """Read battery level from WHOOP GET_BATTERY_LEVEL command response.
+        """Read battery level from standard BLE Battery Service (0x2A19).
         
-        Parses the command response inner frame to extract the real battery
-        level reported by the strap (standard BLE Battery Service gives a
-        different value on WHOOP).
+        The WHOOP strap exposes battery level through the standard BLE Battery
+        Service characteristic. This returns the correct value (confirmed: 18%
+        when the WHOOP app shows 19%). The WHOOP command GET_BATTERY_LEVEL is
+        unreliable due to stale notification capture issues.
         """
+        # Primary: standard BLE Battery Service (verified correct)
+        if self._ble_client and self._ble_client.is_connected:
+            try:
+                data = await self._ble_client.read_gatt_char(
+                    "00002a19-0000-1000-8000-00805f9b34fb"
+                )
+                if data and len(data) > 0:
+                    level = data[0]
+                    return BatteryInfo(level=level, is_charging=False)
+            except Exception as e:
+                logger.debug("Standard battery read failed: %s", e)
+        
+        # Fallback: WHOOP command (may return stale data)
         from whoop.protocol.commands import Command
         resp = await self.send_command(
             Command.GET_BATTERY_LEVEL.build_frame(seq=0, payload=b"", family=self._family)
         )
-        if resp is not None:
+        if resp is not None and len(resp) >= 6:
             try:
-                # resp is the inner record: [type][seq][cmd][payload...]
-                # For GET_BATTERY_LEVEL response, payload contains battery info
-                if len(resp) >= 6:
-                    # type(1) + seq(1) + cmd(1) + battery_data...
-                    # Battery level is typically a uint16 LE in the payload
-                    payload = resp[3:]  # skip type, seq, cmd
-                    level = payload[0] if len(payload) > 0 else 0
-                    # Also check if it's a uint16 LE
-                    if len(payload) >= 2:
-                        level = (payload[1] << 8) | payload[0]
-                    charging = payload[2] > 0 if len(payload) > 2 else False
-                    return BatteryInfo(level=level, is_charging=charging)
+                payload = resp[3:]
+                level = payload[0]
+                if len(payload) >= 2:
+                    level = (payload[1] << 8) | payload[0]
+                charging = payload[2] > 0 if len(payload) > 2 else False
+                return BatteryInfo(level=level, is_charging=charging)
             except Exception as e:
                 logger.debug("Battery parse error: %s", e)
         
-        # Fallback: standard BLE Battery Service
-        try:
-            data = await self._ble_client.read_gatt_char(
-                "00002a19-0000-1000-8000-00805f9b34fb"
-            )
-            if data and len(data) > 0:
-                level = data[0]
-                return BatteryInfo(level=level, is_charging=False)
-        except Exception:
-            pass
         return None
 
     # ------------------------------------------------------------------
