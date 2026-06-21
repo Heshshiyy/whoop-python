@@ -801,19 +801,38 @@ class WhoopBleClient:
             await asyncio.sleep(2.0)
 
             # Step 2: SEND_HISTORICAL_DATA — request the time window.
-            #   Payload format: start_ts (u32 LE) + end_ts (u32 LE) = 8 bytes.
+            #   Try alternative payload formats in sequence.
+            #   Format A: record indices (start_idx u32, end_idx u32) — some firmware
+            #   Format B: timestamps (start_ts u32, end_ts u32)
             #   The strap responds with a stream of type-47 HistoricalDataFrame
-            #   notifications followed by a type-49 Metadata(HISTORY_END) frame.
+            #   frames followed by a type-49 Metadata(HISTORY_END) frame.
+            
             self._seq = (self._seq + 1) & 0xFF
-            hist_payload = struct.pack("<II", start_ts, end_ts)
+            
+            # Try Format A first: record indices (0 to max for "all records")
+            hist_payload = struct.pack("<II", 0, 0xFFFFFFFF)
             hist_frame = Command.SEND_HISTORICAL_DATA.build_frame(
                 seq=self._seq, payload=hist_payload, family=self._family
             )
             await self._ble_client.write_gatt_char(char_uuid, hist_frame, response=True)
             logger.info(
-                "get_history: sent SEND_HISTORICAL_DATA start=%d end=%d (window=%ds)",
-                start_ts, end_ts, end_ts - start_ts,
+                "get_history: sent SEND_HISTORICAL_DATA (record indices 0→max, window=%ds)",
+                end_ts - start_ts,
             )
+            
+            # Wait a moment, then try Format B if no data arrived
+            await asyncio.sleep(2.0)
+            if frame_count[0] == 0:
+                self._seq = (self._seq + 1) & 0xFF
+                hist_payload = struct.pack("<II", start_ts, end_ts)
+                hist_frame = Command.SEND_HISTORICAL_DATA.build_frame(
+                    seq=self._seq, payload=hist_payload, family=self._family
+                )
+                await self._ble_client.write_gatt_char(char_uuid, hist_frame, response=True)
+                logger.info(
+                    "get_history: sent SEND_HISTORICAL_DATA (timestamps start=%d end=%d)",
+                    start_ts, end_ts,
+                )
 
             # Step 3: Wait for HISTORY_END/COMPLETE metadata frame.
             try:
