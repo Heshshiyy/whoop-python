@@ -23,10 +23,11 @@ from whoop.protocol.packet_types import PacketTypes
 
 logger = logging.getLogger(__name__)
 
-# Known WHOOP service UUIDs (both families + alt)
+# Known WHOOP service UUIDs (all families + variants)
 _WHOOP_SERVICE_UUIDS: set[str] = {
     DeviceFamily.WHOOP_4().service_uuid,
     DeviceFamily.WHOOP_4_ALT_SERVICE_UUID,
+    DeviceFamily.WHOOP_4_PUFFIN().service_uuid,  # Primary from official APK
     DeviceFamily.WHOOP_5().service_uuid,
 }
 
@@ -192,6 +193,8 @@ class WhoopBleClient:
 
         if family == DeviceFamilyKind.WHOOP_4:
             self._family = DeviceFamily.WHOOP_4()
+        elif family == DeviceFamilyKind.WHOOP_4_PUFFIN:
+            self._family = DeviceFamily.WHOOP_4_PUFFIN()
         else:
             self._family = DeviceFamily.WHOOP_5()
 
@@ -723,9 +726,12 @@ class WhoopBleClient:
             self._family.cmd_notify_uuid,
             self._family.event_notify_uuid,
             self._family.data_notify_uuid,
-            "61080007-8d6d-82b8-614a-1c8cb0f8dcc6",
+            self._family.aux_notify_uuid,
+            "61080007-8d6d-82b8-614a-1c8cb0f8dcc6",  # legacy fallback
         ]
         for _uuid in _notify_uuids:
+            if _uuid is None:
+                continue
             try:
                 await self._ble_client.start_notify(_uuid, self._on_notification)
             except Exception:

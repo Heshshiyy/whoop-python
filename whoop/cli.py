@@ -109,7 +109,7 @@ async def _cmd_info(args: argparse.Namespace) -> int:
 
     client = WhoopBleClient()
 
-    for family in (DeviceFamilyKind.WHOOP_4, DeviceFamilyKind.WHOOP_5):
+    for family in (DeviceFamilyKind.WHOOP_4, DeviceFamilyKind.WHOOP_4_PUFFIN, DeviceFamilyKind.WHOOP_5):
         ok = await client.connect(address, family, timeout=15.0)
         if ok:
             _print_kv("Family", family.value)
@@ -306,7 +306,11 @@ async def _cmd_history(args: argparse.Namespace) -> int:
     db = WhoopDatabase(db_path)
     client = WhoopBleClient()
 
-    ok = await client.connect(address, DeviceFamilyKind.WHOOP_4, timeout=15.0)
+    ok = False
+    for family in (DeviceFamilyKind.WHOOP_4_PUFFIN, DeviceFamilyKind.WHOOP_4, DeviceFamilyKind.WHOOP_5):
+        ok = await client.connect(address, family, timeout=15.0)
+        if ok:
+            break
     if not ok:
         _print_kv("Error", "Could not connect")
         db.close()
@@ -415,7 +419,7 @@ async def _cmd_battery(args: argparse.Namespace) -> int:
     _print_header(f"Reading battery from {address}...")
 
     client = WhoopBleClient()
-    for family in (DeviceFamilyKind.WHOOP_4, DeviceFamilyKind.WHOOP_5):
+    for family in (DeviceFamilyKind.WHOOP_4, DeviceFamilyKind.WHOOP_4_PUFFIN, DeviceFamilyKind.WHOOP_5):
         ok = await client.connect(address, family, timeout=10.0)
         if ok:
             battery = await client.read_battery()
